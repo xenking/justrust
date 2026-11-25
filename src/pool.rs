@@ -339,7 +339,10 @@ fn targets(pool: &Path) -> Vec<(PathBuf, String, PathBuf, Meta)> {
     out
 }
 
-fn remove_target(kd: &Path, name: &str, dir: &Path) -> bool {
+/// Remove a target dir. With `keep_empty` the dir is recreated empty: the
+/// checkout is still there and its `target` symlink must not dangle, or the
+/// next plain `cargo build` (no justrust to relink it) cannot create dirs.
+fn remove_target(kd: &Path, name: &str, dir: &Path, keep_empty: bool) -> bool {
     let Some(lock) = try_lock(&kd.join(format!("{name}.lock"))) else {
         return false;
     };
@@ -347,9 +350,14 @@ fn remove_target(kd: &Path, name: &str, dir: &Path) -> bool {
     let ok = std::fs::rename(dir, &trash).is_ok();
     // Unlock explicitly: a child forked by another thread shares this open
     // file until it execs and would keep the lock held after the drop.
+    if ok && keep_empty {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let _ = lock.unlock();
     drop(lock);
-    let _ = std::fs::remove_file(kd.join(format!("{name}.lock")));
+    if !keep_empty {
+        let _ = std::fs::remove_file(kd.join(format!("{name}.lock")));
+    }
     let _ = std::fs::remove_dir_all(&trash);
     ok
 }
@@ -363,7 +371,7 @@ pub fn sweep(pool: &Path, max_age: f64) -> (usize, u64) {
         let gone = !meta.root.is_empty() && !Path::new(&meta.root).exists();
         if gone || now - meta.last_used > max_age {
             let size = crate::store::dir_private(&dir);
-            if remove_target(&kd, &name, &dir) {
+            if remove_target(&kd, &name, &dir, !gone && !meta.root.is_empty()) {
                 n += 1;
                 freed += size;
             }
@@ -412,7 +420,8 @@ pub fn reclaim(pool: &Path, want: u64, idle_scale: f64) -> u64 {
         }
         if now - meta.last_used >= 3600.0 * idle_scale {
             let size = crate::store::dir_private(dir);
-            if remove_target(kd, name, dir) {
+            let live = !meta.root.is_empty() && Path::new(&meta.root).exists();
+            if remove_target(kd, name, dir, live) {
                 freed += size;
             }
         }
@@ -503,7 +512,9 @@ mod tests {
         assert_eq!(n, 2, "stale and deleted-checkout targets go");
         assert!(freed >= 2 << 20);
         assert!(dl.exists(), "live checkout kept");
-        assert!(!ds.exists() && !dg.exists());
+        assert!(!dg.exists(), "target of a deleted checkout is gone");
+        assert!(ds.is_dir() && std::fs::read_dir(&ds).unwrap().next().is_none(),
+            "stale target of a live checkout is emptied, not removed, so ./target never dangles");
         assert!(db.exists(), "a held target is never removed");
         drop(held);
         std::fs::remove_dir_all(pool).unwrap();
@@ -534,7 +545,10 @@ mod tests {
         assert!(fresh.join("debug/incremental").exists());
         assert!(busy.join("debug/incremental").exists());
         reclaim(&pool, u64::MAX, 1.0);
-        assert!(!idle.exists(), "whole idle target goes when incremental is not enough");
+        assert!(
+            idle.is_dir() && std::fs::read_dir(&idle).unwrap().next().is_none(),
+            "whole idle target is emptied when incremental is not enough"
+        );
         assert!(fresh.exists() && busy.exists());
         drop(held);
         std::fs::remove_dir_all(pool).unwrap();
