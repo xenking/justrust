@@ -464,7 +464,13 @@ pub fn finish_main(dir: PathBuf) -> ! {
         libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13);
     }
     let t0 = paths::now();
-    let outcome = finish(&dir);
+    let crate_name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let result = finish_why(&dir);
+    let outcome = result.as_ref().ok().copied();
+    let why = result.err();
     let ok = outcome.is_some();
     if !ok {
         let _ = std::fs::remove_dir_all(&dir);
@@ -473,7 +479,7 @@ pub fn finish_main(dir: PathBuf) -> ! {
         let cpu = crate::sys::self_cpu();
         let line = serde_json::json!({
             "t": t0, "secs": paths::now() - t0, "cpu": cpu, "ok": ok,
-            "target_bound": outcome,
+            "target_bound": outcome, "why": why, "stage": crate_name,
         });
         let _ = paths::append_line(&root.join("finish.jsonl"), &line.to_string());
         maybe_gc(root);
@@ -530,8 +536,15 @@ fn finisher_admission_with(
 
 /// Hash and check the staged outputs, then publish them.
 fn finish(dir: &Path) -> Option<bool> {
+    finish_why(dir).ok()
+}
+
+/// `finish`, naming the step that refused in `Err` so `finish.jsonl` can say
+/// why a unit was not published (a miss nobody could explain before).
+fn finish_why(dir: &Path) -> Result<bool, &'static str> {
     let mut staged: Staged =
-        serde_json::from_slice(&std::fs::read(dir.join("stage.json")).ok()?).ok()?;
+        serde_json::from_slice(&std::fs::read(dir.join("stage.json")).map_err(|_| "no stage")?)
+            .map_err(|_| "bad stage")?;
     let mut outs = Outputs {
         files: Vec::new(),
         stderr: staged.stderr,
@@ -542,11 +555,11 @@ fn finish(dir: &Path) -> Option<bool> {
     for name in &staged.files {
         let p = dir.join(name);
         let text = name.ends_with(".d");
-        if !text && !unlink_copy(&p)? {
-            return None;
+        if !text && !unlink_copy(&p).ok_or("unlink failed")? {
+            return Err("output rewritten after staging");
         }
         if !text {
-            let bytes = std::fs::read(&p).ok()?;
+            let bytes = std::fs::read(&p).map_err(|_| "read output")?;
             if !depcache::target_refs_are_inputs(&bytes, &staged.target, &staged.target_inputs)
                 || staged
                     .workspace
@@ -556,11 +569,14 @@ fn finish(dir: &Path) -> Option<bool> {
                 // Do not weaken the portable guard. Runtime paths such as
                 // CARGO_BIN_EXE or unremapped workspace paths remain valid only
                 // in their original checkout/target.
-                staged.target_bound.as_ref()?;
+                staged
+                    .target_bound
+                    .as_ref()
+                    .ok_or("output embeds the workspace or target path")?;
                 target_bound = true;
             }
             if !name.ends_with(".rlib") && !name.ends_with(".rmeta") {
-                let need = depcache::needed_glibc(&p)?;
+                let need = depcache::needed_glibc(&p).ok_or("glibc probe")?;
                 if need > (0, 0) {
                     outs.glibc = Some(outs.glibc.map_or(need, |g| g.max(need)));
                 }
@@ -568,37 +584,61 @@ fn finish(dir: &Path) -> Option<bool> {
         }
         outs.files.push(OutFile {
             name: name.clone(),
-            hash: depcache::file_hash(&p, false)?,
+            hash: depcache::file_hash(&p, false).ok_or("hash")?,
             text,
         });
     }
     if target_bound {
-        let (manifest, out) = staged.target_bound.take()?;
+        let (manifest, out) = staged.target_bound.take().ok_or("target-bound tier")?;
         staged.manifest = manifest;
         staged.entry.out = out;
     }
     let _ = std::fs::remove_file(dir.join("stage.json"));
-    std::fs::write(dir.join("meta.json"), serde_json::to_vec(&outs).ok()?).ok()?;
-    let root = dir.parent()?.parent()?;
-    create_cache_dir(root, &root.join("o")).ok()?;
+    std::fs::write(dir.join("meta.json"), serde_json::to_vec(&outs).map_err(|_| "meta")?)
+        .map_err(|_| "write meta")?;
+    let root = dir.parent().and_then(Path::parent).ok_or("stage path")?;
+    create_cache_dir(root, &root.join("o")).map_err(|_| "create o")?;
     let final_dir = root.join("o").join(&staged.entry.out);
     if std::fs::rename(dir, &final_dir).is_err() {
         // Another process committed the same result first.
         let _ = std::fs::remove_dir_all(dir);
         if !final_dir.join("meta.json").is_file() {
-            return None;
+            return Err("rename lost, no winner");
         }
     }
     append_once(
         &staged.manifest,
-        &serde_json::to_string(&staged.entry).ok()?,
-    )?;
-    Some(target_bound)
+        &serde_json::to_string(&staged.entry).map_err(|_| "entry")?,
+    )
+    .ok_or("manifest append")?;
+    Ok(target_bound)
 }
 
 fn stamp(m: &std::fs::Metadata) -> String {
     let (s, ns) = crate::sys::mtime(m);
     format!("{}:{}:{s}:{ns}", crate::sys::file_id(m).1, m.len())
+}
+
+/// Whether a staged file still is what was staged. Same inode and size, and
+/// no later modification time. Cargo moves the mtime of finished outputs
+/// back by up to a second after the compiler exits (measured: 41 of 48 jcode
+/// units on macOS), so equality refused nearly every unit; a rewrite in place
+/// can only move it forward.
+fn stamp_unchanged(want: &str, got: &str) -> bool {
+    let parse = |s: &str| -> Option<(String, u64, u64)> {
+        let mut it = s.splitn(4, ':');
+        let ino = it.next()?;
+        let len = it.next()?;
+        let rest = it.next()?;
+        let ns = it.next()?;
+        let secs: u64 = rest.parse().ok()?;
+        let ns: u64 = ns.parse().ok()?;
+        Some((format!("{ino}:{len}"), secs, ns))
+    };
+    match (parse(want), parse(got)) {
+        (Some(w), Some(g)) => w.0 == g.0 && (g.1, g.2) <= (w.1, w.2),
+        _ => want == got,
+    }
 }
 
 /// Replace a staged hard link with a private copy. `Some(false)` when the
@@ -608,7 +648,8 @@ fn unlink_copy(p: &Path) -> Option<bool> {
     let stamp_file = PathBuf::from(format!("{}.stamp", p.display()));
     let want = std::fs::read_to_string(&stamp_file).ok()?;
     let _ = std::fs::remove_file(&stamp_file);
-    if stamp(&std::fs::metadata(p).ok()?) != want {
+    let got = stamp(&std::fs::metadata(p).ok()?);
+    if !stamp_unchanged(&want, &got) {
         return Some(false);
     }
     let tmp = PathBuf::from(format!("{}.copy", p.display()));
@@ -616,7 +657,7 @@ fn unlink_copy(p: &Path) -> Option<bool> {
         return None;
     }
     // Checked again after the copy: any write in between moves the mtime.
-    if stamp(&std::fs::metadata(p).ok()?) != want {
+    if !stamp_unchanged(&want, &stamp(&std::fs::metadata(p).ok()?)) {
         let _ = std::fs::remove_file(&tmp);
         return Some(false);
     }
@@ -664,6 +705,19 @@ fn maybe_gc(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_staged_file_whose_mtime_moved_back_is_unchanged_but_a_later_write_is_not() {
+        let want = "661537915:481967:1795617900:933390113";
+        // Cargo moved the mtime back: same inode and size.
+        assert!(stamp_unchanged(want, "661537915:481967:1795617899:628891791"));
+        assert!(stamp_unchanged(want, want));
+        // Rewritten in place later: newer mtime, or a different size or inode.
+        assert!(!stamp_unchanged(want, "661537915:481967:1795617900:933390114"));
+        assert!(!stamp_unchanged(want, "661537915:481967:1795617901:0"));
+        assert!(!stamp_unchanged(want, "661537915:481968:1795617899:0"));
+        assert!(!stamp_unchanged(want, "661537916:481967:1795617899:0"));
+    }
 
     #[test]
     fn finisher_admission_drops_contention_and_releases_on_exit() {
