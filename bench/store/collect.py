@@ -12,7 +12,7 @@ from pathlib import Path
 
 lab, variant = Path(sys.argv[1]), sys.argv[2]
 v = lab / variant
-meta = dict(l.strip().split("=", 1) for l in (v / "meta.txt").read_text().splitlines() if "=" in l)
+meta = dict(kv.split("=", 1) for kv in (v / "meta.txt").read_text().split() if "=" in kv)
 base = int(meta["base_used_mb"])
 samples = [int(l.split()[1]) for l in (v / "df.log").read_text().splitlines() if l.strip()]
 steps = []

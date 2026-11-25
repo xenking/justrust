@@ -365,7 +365,7 @@ pub fn prune_roots(roots: &[&Path], rules: &Rules) -> Pruned {
 /// is a clone of a live target file frees nothing until that file goes.
 const RECLAIM_MIN_PRIVATE: u64 = 1024 * 1024;
 
-fn reclaim_in(roots: &[PathBuf], want: u64, ephemeral_only: bool) -> u64 {
+fn reclaim_in(roots: &[PathBuf], want: u64, ephemeral_only: bool, idle_scale: f64) -> u64 {
     let now = paths::now();
     let mut all: Vec<(usize, Entry)> = Vec::new();
     for (i, root) in roots.iter().enumerate() {
@@ -377,7 +377,7 @@ fn reclaim_in(roots: &[PathBuf], want: u64, ephemeral_only: bool) -> u64 {
         if freed >= want {
             break;
         }
-        if (ephemeral_only && !e.ephemeral) || now - e.last_used < EPHEMERAL_GRACE_SECS {
+        if (ephemeral_only && !e.ephemeral) || now - e.last_used < EPHEMERAL_GRACE_SECS * idle_scale {
             continue;
         }
         // What deleting it frees now, not what it would weigh alone.
@@ -397,13 +397,13 @@ fn reclaim_in(roots: &[PathBuf], want: u64, ephemeral_only: bool) -> u64 {
 }
 
 /// Low-disk reclaim, cheapest first: idle link outputs.
-pub fn reclaim_ephemeral(roots: &[PathBuf], want: u64) -> u64 {
-    reclaim_in(roots, want, true)
+pub fn reclaim_ephemeral(roots: &[PathBuf], want: u64, idle_scale: f64) -> u64 {
+    reclaim_in(roots, want, true, idle_scale)
 }
 
 /// Low-disk reclaim: least recently used entries that free real space.
-pub fn reclaim_lru(roots: &[PathBuf], want: u64) -> u64 {
-    reclaim_in(roots, want, false)
+pub fn reclaim_lru(roots: &[PathBuf], want: u64, idle_scale: f64) -> u64 {
+    reclaim_in(roots, want, false, idle_scale)
 }
 
 /// Cap for one root: the local-unit cache has its own, the rest follow the

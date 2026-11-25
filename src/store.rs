@@ -389,6 +389,7 @@ pub fn admit(cwd: &Path, cmd: &str, reserve: u64, err: &mut dyn Write) -> Option
     let started = Instant::now();
     let budget = wait_budget();
     let mut reclaimed = false;
+    let mut last_reclaim = Instant::now();
     let mut last_note = Instant::now() - Duration::from_secs(60);
     loop {
         // The gate makes check-then-create atomic across processes.
@@ -457,8 +458,12 @@ pub fn admit(cwd: &Path, cmd: &str, reserve: u64, err: &mut dyn Write) -> Option
                 // A reclaim that found nothing is retried now and then:
                 // other builds finishing and agents deleting worktrees free
                 // space without telling us.
-                if started.elapsed().as_secs() % 120 < 3 {
-                    reclaim(need.saturating_sub(free));
+                // After half a minute of waiting the thresholds go to zero.
+                if started.elapsed() >= Duration::from_secs(30)
+                    && last_reclaim.elapsed() >= Duration::from_secs(30)
+                {
+                    last_reclaim = Instant::now();
+                    reclaim_scaled(need.saturating_sub(free), 0.0);
                 }
             }
         }
@@ -559,7 +564,14 @@ pub fn registered_roots(kind: &str) -> Vec<PathBuf> {
 /// Safe to run beside builds: store entries leave by atomic rename, slots and
 /// pool targets only when their lock is free.
 pub fn reclaim(want: u64) -> u64 {
-    let _ = want;
+    reclaim_scaled(want, 1.0)
+}
+
+/// `reclaim` with every idle threshold multiplied by `idle_scale`. A build
+/// that has waited for room passes 0: locks already protect what is in use,
+/// so the thresholds only protect warmth, and warmth is worth less than a
+/// build that cannot start.
+pub fn reclaim_scaled(want: u64, idle_scale: f64) -> u64 {
     let mut freed = 0;
     let roots: Vec<PathBuf> = [
         crate::depcache::cache_dir(),
@@ -570,11 +582,11 @@ pub fn reclaim(want: u64) -> u64 {
     .filter(|r| r.join("o").is_dir())
     .collect();
     // 1. Link outputs nobody has touched for a while: the cheapest bytes.
-    freed += crate::depcache_gc::reclaim_ephemeral(&roots, want);
+    freed += crate::depcache_gc::reclaim_ephemeral(&roots, want, idle_scale);
     // 2. Incremental state of idle slots, then idle slots themselves.
     if freed < want {
         for root in registered_roots("slots") {
-            freed += crate::slots::reclaim(&root, want.saturating_sub(freed));
+            freed += crate::slots::reclaim(&root, want.saturating_sub(freed), idle_scale);
             if freed >= want {
                 break;
             }
@@ -584,11 +596,11 @@ pub fn reclaim(want: u64) -> u64 {
     if freed < want
         && let Some(pool) = crate::pool::pool_root().filter(|p| p.is_dir())
     {
-        freed += crate::pool::reclaim(&pool, want - freed);
+        freed += crate::pool::reclaim(&pool, want - freed, idle_scale);
     }
     // 3. Least recently used cache entries that free real space.
     if freed < want {
-        freed += crate::depcache_gc::reclaim_lru(&roots, want - freed);
+        freed += crate::depcache_gc::reclaim_lru(&roots, want - freed, idle_scale);
     }
     freed
 }

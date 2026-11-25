@@ -1907,7 +1907,7 @@ fn gc_with(root: &Path, max_age: f64, budget: u64) -> (Vec<usize>, u64) {
 /// (idle 10 min or more), then idle slots (30 min or more) are removed,
 /// least recently used first, until `want` private bytes are freed. A slot
 /// in use is never touched. Returns private bytes freed.
-pub fn reclaim(root: &Path, want: u64) -> u64 {
+pub fn reclaim(root: &Path, want: u64, idle_scale: f64) -> u64 {
     let now = paths::now();
     let mut slots: Vec<(usize, f64)> = slot_numbers(root)
         .into_iter()
@@ -1922,7 +1922,7 @@ pub fn reclaim(root: &Path, want: u64) -> u64 {
         if freed >= want {
             return freed;
         }
-        if idle >= 600.0 {
+        if idle >= 600.0 * idle_scale {
             freed += drop_incremental(root, n);
         }
     }
@@ -1930,7 +1930,7 @@ pub fn reclaim(root: &Path, want: u64) -> u64 {
         if freed >= want {
             break;
         }
-        if idle >= 1800.0 {
+        if idle >= 1800.0 * idle_scale {
             let size = crate::store::dir_private(&root.join(n.to_string()));
             if remove_slot(root, n) {
                 freed += size;
@@ -2800,14 +2800,14 @@ mod tests {
         slot_with_incremental(&root, 1, 3600.0, 2);
         slot_with_incremental(&root, 2, 30.0, 2);
         let busy = try_lock(&root.join("1.lock")).unwrap();
-        let freed = reclaim(&root, 1);
+        let freed = reclaim(&root, 1, 1.0);
         assert!(freed >= 2 << 20, "{freed}");
         assert!(!root.join("0/debug/incremental").exists());
         assert!(root.join("1/debug/incremental").exists(), "in use");
         assert!(root.join("2/debug/incremental").exists(), "idle under 10 minutes");
         // Wanting more than incremental dirs can give: idle slots go whole,
         // but not the busy one and not the one used 30 s ago.
-        let freed = reclaim(&root, u64::MAX);
+        let freed = reclaim(&root, u64::MAX, 1.0);
         let _ = freed; // private bytes of a fresh 4-byte file may read 0
         assert!(!root.join("0").exists());
         assert!(root.join("1/debug/incremental").exists());

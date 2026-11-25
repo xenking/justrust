@@ -390,7 +390,7 @@ pub fn sweep(pool: &Path, max_age: f64) -> (usize, u64) {
 /// Low-disk reclaim: idle targets' incremental dirs (idle 10 min or more),
 /// then whole targets idle an hour or more, least recently used first.
 /// Returns private bytes freed.
-pub fn reclaim(pool: &Path, want: u64) -> u64 {
+pub fn reclaim(pool: &Path, want: u64, idle_scale: f64) -> u64 {
     let now = paths::now();
     let mut all = targets(pool);
     all.sort_by(|a, b| a.3.last_used.total_cmp(&b.3.last_used));
@@ -399,7 +399,7 @@ pub fn reclaim(pool: &Path, want: u64) -> u64 {
         if freed >= want {
             return freed;
         }
-        if now - meta.last_used >= 600.0
+        if now - meta.last_used >= 600.0 * idle_scale
             && let Some(lock) = try_lock(&kd.join(format!("{name}.lock")))
         {
             freed += crate::slots::drop_incremental_in(dir);
@@ -410,7 +410,7 @@ pub fn reclaim(pool: &Path, want: u64) -> u64 {
         if freed >= want {
             break;
         }
-        if now - meta.last_used >= 3600.0 {
+        if now - meta.last_used >= 3600.0 * idle_scale {
             let size = crate::store::dir_private(dir);
             if remove_target(kd, name, dir) {
                 freed += size;
@@ -528,12 +528,12 @@ mod tests {
         };
         let (idle, fresh, busy) = (mk("idle", 7200.0), mk("fresh", 30.0), mk("busy", 7200.0));
         let held = try_lock(&busy.parent().unwrap().join("default.lock")).unwrap();
-        let freed = reclaim(&pool, 1);
+        let freed = reclaim(&pool, 1, 1.0);
         assert!(freed >= 2 << 20);
         assert!(!idle.join("debug/incremental").exists() && idle.join("debug/libx.rlib").exists());
         assert!(fresh.join("debug/incremental").exists());
         assert!(busy.join("debug/incremental").exists());
-        reclaim(&pool, u64::MAX);
+        reclaim(&pool, u64::MAX, 1.0);
         assert!(!idle.exists(), "whole idle target goes when incremental is not enough");
         assert!(fresh.exists() && busy.exists());
         drop(held);
