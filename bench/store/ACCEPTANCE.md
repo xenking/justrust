@@ -20,5 +20,7 @@ project with `itoa` and `fastrand`, and a `build.rs` that holds a build open).
 | Slots GC by private bytes, incremental first, `--clean` keeps warm slots | unit tests in `slots.rs`; `justrust slots --clean --idle-min` | covered by tests only. Not exercised against live slots (agent mode needs a slot-eligible session) |
 | Savings from the work | `RESULTS.md` E1 and E2 | churn +0.76 vs +3.37 GB over 8 cycles; ENOSPC 0 of 3 vs 3 of 3 |
 
+| Local-unit cache publishes and hits across worktrees | portable probe on jcode, two worktrees, same SHA | before the stamp fix 3 of 48 units published; after, 52 of 52, and the second worktree hit 44 of 48 (`check`) and 72 of 89 (`test --no-run`, 139 s to 109 s). Heavy crates refused with a recorded reason |
+
 Not covered by any real run: 5 concurrent lanes, a Desktop build, the live
 daemon, `selfdev build` through `dev_cargo.sh` with the justrust proxy installed.

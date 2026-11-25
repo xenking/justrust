@@ -51,8 +51,34 @@ lane 2 took 208 s instead of 66 s, rebuilding that state).
 The queue lines the build printed:
 `justrust: waiting for disk space on ...: 8.5 GB free, 9.0 GB wanted, 1 other build(s) hold reservations (queued 1s)`.
 
-## Portable local-unit cache across worktrees (opt-in, pilot)
+## Portable local-unit cache across worktrees (`JUSTRUST_LOCALCACHE_PORTABLE=1`)
 
-`JUSTRUST_LOCALCACHE_PORTABLE=1`, second worktree at the same SHA: 63 of 90 local
-units hit, but none of `jcode_base`, `jcode_app_core`, `jcode_tui` (about 70% of
-local compile time). Kept opt-in. Why those three miss is not established here.
+The first pilot (0.1.58) hit 63 of 90 units in a second worktree and none of the
+heavy crates. Two causes, found with `finish.jsonl` (now records `why`):
+
+1. **A bug, fixed here.** `finish` refused 45 of 48 jcode units with "output
+   rewritten after staging": cargo moves the mtime of a finished output back by
+   up to a second (same inode, same size), and the stamp compared mtime by
+   equality. The check now refuses only a later mtime, a different size or a
+   different inode. Published units went from 3 of 48 to 52 of 52. This also
+   affects the default (non-portable) mode: 0.1.58 published almost no local
+   rmeta/rlib units, which is why its local-unit hit rate was near 0.
+2. **A correct refusal.** In the `test` profile 18 of 285 units, the heavy ones
+   (`jcode_base`, `jcode_app_core`, `jcode_tui`), are refused with "output embeds
+   the workspace or target path" (a compile-time `CARGO_MANIFEST_DIR` under the
+   `test-support` feature). They are not path-independent, so they never hit
+   across worktrees.
+
+Same SHA, fresh worktree, warm dependency cache, release binary, host
+machine under load:
+
+| command | portable | wall | local units hit |
+| --- | --- | --- | --- |
+| `check -p jcode-base`, worktree 2 | on | 12.7 s | 44 of 48 |
+| `check -p jcode-base`, worktree 3 | off | 15.3 s | 0 of 48 |
+| `test -p jcode-tui --no-run`, worktree 2 | on | 109 s | 72 of 89 |
+| `test -p jcode-tui --no-run`, worktree 3 | off | 139 s | 0 of 89 |
+
+Worktree 2 target private bytes 3.05 GB against 3.68 GB. Portable stays opt-in:
+it remaps the workspace path in outputs (`/jr-ws/...` in panic locations and
+debug info), which changes what an agent reads in a failure.

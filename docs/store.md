@@ -13,7 +13,8 @@ killing them with ENOSPC.
 | `du` of the shared `target/debug` vs private | 50.3 GB vs 17.8 GB private |
 | local-unit cache (`localcache`) vs its 10 GB cap | 23 GB, 47 link outputs = 14.7 GB of it |
 | one cold `test -p jcode-tui` in a fresh worktree | 7.0 GB of disk, 3.2 GB of it `incremental/` |
-| portable local-unit hits across worktrees | 63 of 90 units, 0 of the 4 crates that hold ~70% of compile time |
+| local-unit cache publish rate (portable, jcode `check`) | 3 of 48 before the stamp fix, 52 of 52 after |
+| portable local-unit hits in a second worktree | `check -p jcode-base` 44 of 48, `test -p jcode-tui` 72 of 89; heavy crates refused (embed `CARGO_MANIFEST_DIR`) |
 
 Method: `ATTR_CMNEXT_PRIVATESIZE` (bytes a file frees if deleted) summed per
 tree, `df` on an isolated sparse APFS volume for peak/final.
@@ -75,6 +76,10 @@ so two worktrees in one target overwrite each other (FINDINGS 2026-10-10).
   (an entry that is a clone of a live file frees nothing).
 - **Retention**: run records 1500 / 14 days / 1 GB, run index, journals and
   logs bounded to their newest bytes, hint snapshots 30 days.
+- **Local-unit cache stamp fix.** Cargo moves a finished output's mtime back after
+  the compiler exits, and the stamp check compared mtime by equality, so almost
+  every local unit was refused publication. It now refuses only a later mtime, a
+  different size or inode. `finish.jsonl` records `why` for each refusal.
 - `append_line` starts a new line after a torn last line (ENOSPC), so one torn
   write no longer loses the next one.
 
@@ -90,11 +95,13 @@ so two worktrees in one target overwrite each other (FINDINGS 2026-10-10).
 
 ## Not done, and why
 
-- **Cross-worktree reuse of jcode's heavy crates.** In the pilot, portable mode hit
-  63 of 90 local units in a second worktree, but not `jcode_base`, `jcode_app_core`
-  or `jcode_tui`, which hold about 70% of local compile time. Why they miss was
-  not established (the first two have no non-test `CARGO_MANIFEST_DIR`). Portable
-  stays opt-in (`JUSTRUST_LOCALCACHE_PORTABLE=1`).
+- **Cross-worktree reuse of jcode's heavy crates.** In the `test` profile
+  `jcode_base`, `jcode_app_core` and `jcode_tui` embed `CARGO_MANIFEST_DIR`, so the
+  portable guard correctly refuses them (18 of 285 units; `finish.jsonl` says
+  why). Portable mode otherwise hits 72 of 89 units in a second worktree
+  (`test --no-run` 139 s to 109 s). It stays opt-in
+  (`JUSTRUST_LOCALCACHE_PORTABLE=1`) because it remaps paths in outputs. A fix
+  in the heavy crates (no compile-time manifest path outside tests) is the lever.
 - **Single-flight of identical in-flight units** across simultaneous cold lanes.
 
 ## Commands
