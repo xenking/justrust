@@ -55,7 +55,9 @@ use std::path::{Path, PathBuf};
 
 pub const FINISH_ARG: &str = "__localcache-finish";
 const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const GC_INTERVAL_SECS: f64 = 600.0;
+/// Link outputs arrive at one per build per agent and are hundreds of MB, so
+/// the finisher collects every two minutes (a scan is about a second).
+const GC_INTERVAL_SECS: f64 = 120.0;
 
 pub fn enabled() -> bool {
     if !depcache::enabled() {

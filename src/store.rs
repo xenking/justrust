@@ -176,8 +176,8 @@ pub fn store_cap(free_total: Option<(u64, u64)>) -> u64 {
 
 /// Executables and test binaries in the local-unit cache ("ephemeral"
 /// entries): how long one may sit idle (`JUSTRUST_EPHEMERAL_IDLE_MIN`, 30)
-/// and how much of them the store keeps (`JUSTRUST_EPHEMERAL_MAX`, an eighth
-/// of `cap` up to 8 GiB). They stay private to the agent that linked them
+/// and how much of them the store keeps (`JUSTRUST_EPHEMERAL_MAX`, a quarter
+/// of `cap`, 2 to 8 GiB). They stay private to the agent that linked them
 /// in every way except a revert, which is the only time they hit.
 pub fn ephemeral_idle_secs() -> f64 {
     std::env::var("JUSTRUST_EPHEMERAL_IDLE_MIN")
@@ -194,7 +194,7 @@ pub fn ephemeral_cap(cap: u64) -> u64 {
             if cap == 0 {
                 8 * GIB
             } else {
-                (cap / 8).min(8 * GIB)
+                (cap / 4).clamp(2 * GIB, 8 * GIB)
             }
         })
 }
