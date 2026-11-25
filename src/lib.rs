@@ -355,6 +355,10 @@ enum Command {
         /// Purpose of the dir: `default`, `verify`, `rollout`, ...
         #[arg(long, default_value = "default")]
         name: String,
+        /// Use a stable key instead of the checkout (for builds that run in
+        /// a fresh checkout path each time but should reuse their artifacts).
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Disk governor: free space, leases, store sizes (allocated and
     /// private), low-disk reclaim and retention.
@@ -1274,7 +1278,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             reclaim,
             retention,
         } => store::command(gc, reclaim, retention)?,
-        Command::TargetDir { name } => pool::command(&name)?,
+        Command::TargetDir { name, key } => pool::command(&name, key.as_deref())?,
         Command::Cache {
             prune,
             clear,

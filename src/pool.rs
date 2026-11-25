@@ -28,11 +28,22 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-pub fn enabled() -> bool {
-    matches!(
-        std::env::var("JUSTRUST_POOL").as_deref(),
-        Ok("1" | "on" | "true" | "yes")
-    )
+/// `JUSTRUST_POOL`: `1`/`link` makes `<workspace>/target` a symlink into the
+/// pool (every tool that expects `./target` keeps working, the bytes are
+/// managed); `dir` passes `--target-dir <pool dir>` instead.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    Off,
+    Link,
+    Dir,
+}
+
+fn mode() -> Mode {
+    match std::env::var("JUSTRUST_POOL").as_deref() {
+        Ok("1" | "on" | "true" | "yes" | "link") => Mode::Link,
+        Ok("dir") => Mode::Dir,
+        _ => Mode::Off,
+    }
 }
 
 pub fn pool_root() -> Option<PathBuf> {
@@ -93,11 +104,25 @@ pub fn resolve(cwd: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn resolve_in(pool: &Path, root: &Path, name: &str) -> Option<PathBuf> {
-    let kd = key_dir(pool, root);
+    resolve_at(&key_dir(pool, root), &root.to_string_lossy(), name)
+}
+
+/// A pool dir under an explicit key instead of a checkout: for builds whose
+/// checkout path changes every run but whose artifacts should be reused
+/// (the paired acceptance smoke). No checkout to disappear, so the sweeper
+/// only ages it out.
+fn resolve_keyed(pool: &Path, key: &str, name: &str) -> Option<PathBuf> {
+    if !valid_name(key) {
+        return None;
+    }
+    resolve_at(&pool.join(format!("key-{key}")), "", name)
+}
+
+fn resolve_at(kd: &Path, root: &str, name: &str) -> Option<PathBuf> {
     let dir = kd.join(name);
     std::fs::create_dir_all(&dir).ok()?;
     let meta = Meta {
-        root: root.to_string_lossy().into_owned(),
+        root: root.to_owned(),
         last_used: paths::now(),
     };
     let tmp = kd.join(format!(".pool.json.{}", std::process::id()));
@@ -117,10 +142,70 @@ fn user_chose_target(args: &[OsString]) -> bool {
             .any(|a| a.contains("target-dir"))
 }
 
-/// With `JUSTRUST_POOL=1`, give a build that chose no target dir the
+/// The cargo workspace root containing `cwd`: the highest ancestor (up to
+/// the git toplevel) whose Cargo.toml has a `[workspace]`, else the nearest
+/// ancestor with a Cargo.toml.
+fn workspace_root(cwd: &Path) -> Option<PathBuf> {
+    let top = checkout_root(cwd);
+    let mut nearest = None;
+    let mut best = None;
+    for d in cwd.ancestors() {
+        if let Ok(text) = std::fs::read_to_string(d.join("Cargo.toml")) {
+            nearest.get_or_insert_with(|| d.to_path_buf());
+            if text.lines().any(|l| l.trim() == "[workspace]") {
+                best = Some(d.to_path_buf());
+            }
+        }
+        if d == top {
+            break;
+        }
+    }
+    best.or(nearest)
+}
+
+/// Make `<workspace>/target` a symlink to the pool's `default` for this
+/// checkout. An existing real `target` dir is moved into the pool (same
+/// volume, one rename) so its warm state is kept and from then on managed.
+/// Returns the pool dir. Never replaces a symlink the user made elsewhere.
+fn link_target(cwd: &Path) -> Option<PathBuf> {
+    let root = workspace_root(cwd)?;
+    let pool = pool_root()?;
+    let link = root.join("target");
+    let kd = key_dir(&pool, &root);
+    let dest = kd.join("default");
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) if m.file_type().is_symlink() => {
+            // Ours already, or deliberately elsewhere: leave it.
+            return if std::fs::read_link(&link).ok()? == dest {
+                resolve_in(&pool, &root, "default")
+            } else {
+                None
+            };
+        }
+        Ok(m) if m.is_dir() => {
+            std::fs::create_dir_all(&kd).ok()?;
+            if dest.exists() && std::fs::read_dir(&dest).ok()?.next().is_some() {
+                return None;
+            }
+            let _ = std::fs::remove_dir(&dest);
+            std::fs::rename(&link, &dest).ok()?;
+        }
+        Ok(_) => return None,
+        Err(_) => {}
+    }
+    let dir = resolve_in(&pool, &root, "default")?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dir, &link).ok()?;
+    #[cfg(not(unix))]
+    return None;
+    crate::store::register_root("pool", &pool);
+    Some(dir)
+}
+
+/// With `JUSTRUST_POOL` set, give a build that chose no target dir the
 /// checkout's pool `default`. Any failure leaves the arguments alone.
 pub fn with_target(args: Vec<OsString>) -> Vec<OsString> {
-    if !enabled() || user_chose_target(&args) {
+    if mode() == Mode::Off || user_chose_target(&args) {
         return args;
     }
     let Some(sub) = crate::record::subcommand(&args) else {
@@ -130,6 +215,14 @@ pub fn with_target(args: Vec<OsString>) -> Vec<OsString> {
         sub.as_str(),
         "check" | "c" | "test" | "t" | "build" | "b" | "clippy" | "run" | "r" | "bench" | "doc"
     ) {
+        return args;
+    }
+    if mode() == Mode::Link {
+        // The symlink is the whole change: cargo resolves it, and the
+        // pool lock is taken on the pool dir behind it.
+        if let Ok(cwd) = std::env::current_dir() {
+            let _ = link_target(&cwd);
+        }
         return args;
     }
     let Some(dir) = std::env::current_dir()
@@ -190,7 +283,14 @@ fn pool_target_of(args: &[OsString], pool: &Path) -> Option<PathBuf> {
 /// use. A held target is never swept or reclaimed.
 pub fn hold(args: &[OsString]) -> Option<Hold> {
     let pool = pool_root()?;
-    let dir = pool_target_of(args, &pool)?;
+    let dir = pool_target_of(args, &pool).or_else(|| {
+        // Link mode: `<workspace>/target` points into the pool.
+        let cwd = std::env::current_dir().ok()?;
+        let link = workspace_root(&cwd)?.join("target");
+        let dest = std::fs::read_link(&link).ok()?;
+        let rel = dest.strip_prefix(&pool).ok()?;
+        (rel.components().count() == 2).then_some(dest)
+    })?;
     let name = dir.file_name()?.to_string_lossy().into_owned();
     let kd = dir.parent()?;
     std::fs::create_dir_all(&dir).ok()?;
@@ -257,7 +357,7 @@ pub fn sweep(pool: &Path, max_age: f64) -> (usize, u64) {
     let now = paths::now();
     let (mut n, mut freed) = (0, 0);
     for (kd, name, dir, meta) in targets(pool) {
-        let gone = !Path::new(&meta.root).exists();
+        let gone = !meta.root.is_empty() && !Path::new(&meta.root).exists();
         if gone || now - meta.last_used > max_age {
             let size = crate::store::dir_private(&dir);
             if remove_target(&kd, &name, &dir) {
@@ -333,10 +433,17 @@ pub fn summary(pool: &Path) -> String {
 }
 
 /// `justrust target-dir [--name N]`.
-pub fn command(name: &str) -> anyhow::Result<()> {
+pub fn command(name: &str, key: Option<&str>) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let dir = resolve(&cwd, name)
-        .ok_or_else(|| anyhow::anyhow!("invalid target name {name:?} or no justrust home"))?;
+    let dir = match key {
+        Some(k) => pool_root().and_then(|p| {
+            let d = resolve_keyed(&p, k, name)?;
+            crate::store::register_root("pool", &p);
+            Some(d)
+        }),
+        None => resolve(&cwd, name),
+    }
+    .ok_or_else(|| anyhow::anyhow!("invalid target name/key or no justrust home"))?;
     println!("{}", dir.display());
     Ok(())
 }
@@ -445,5 +552,60 @@ mod tests {
         assert_eq!(pool_target_of(&a(&["test", "--target-dir", "/tmp/t"]), &pool), None);
         assert_eq!(pool_target_of(&a(&["test", "--target-dir", "/h/.justrust/pool/k-ws"]), &pool), None);
         assert_eq!(pool_target_of(&a(&["test", "--", "--target-dir", "/h/.justrust/pool/k/x"]), &pool), None);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn link_mode_moves_an_existing_target_into_the_pool_and_leaves_a_symlink() {
+        let base = std::env::temp_dir().join(format!("jr-pool-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("crates/a")).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/a\"]\n").unwrap();
+        std::fs::write(ws.join("crates/a/Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
+        std::fs::create_dir_all(ws.join("target/debug")).unwrap();
+        std::fs::write(ws.join("target/debug/warm"), b"warm state").unwrap();
+        // From a member directory the workspace root is still the top.
+        assert_eq!(workspace_root(&ws.join("crates/a")).unwrap(), ws);
+        // The pool lives under JUSTRUST_HOME; drive the pieces with an
+        // explicit pool to avoid touching the process environment.
+        let pool = base.join("pool");
+        let kd = key_dir(&pool, &ws);
+        std::fs::create_dir_all(&kd).unwrap();
+        std::fs::rename(ws.join("target"), kd.join("default")).unwrap();
+        std::os::unix::fs::symlink(kd.join("default"), ws.join("target")).unwrap();
+        // Cargo and every tool that reads ./target see the same bytes.
+        assert_eq!(std::fs::read(ws.join("target/debug/warm")).unwrap(), b"warm state");
+        assert_eq!(std::fs::read_link(ws.join("target")).unwrap(), kd.join("default"));
+        // Deleting the checkout lets the sweeper reclaim the bytes.
+        resolve_in(&pool, &ws, "default").unwrap();
+        std::fs::remove_dir_all(&ws).unwrap();
+        let (n, _) = sweep(&pool, 1e9);
+        assert_eq!(n, 1);
+        assert!(!kd.join("default").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+
+    #[test]
+    fn keyed_dirs_ignore_the_checkout_and_only_age_out() {
+        let pool = std::env::temp_dir().join(format!("jr-pool-keyed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pool);
+        let a = resolve_keyed(&pool, "rollout", "cli").unwrap();
+        assert_eq!(resolve_keyed(&pool, "rollout", "cli").unwrap(), a);
+        assert_ne!(resolve_keyed(&pool, "rollout", "desktop").unwrap(), a);
+        assert!(resolve_keyed(&pool, "../x", "cli").is_none());
+        // No checkout to vanish: fresh stays, aged goes.
+        assert_eq!(sweep(&pool, 3600.0).0, 0);
+        assert_eq!(sweep(&pool, -1.0).0, 2);
+        std::fs::remove_dir_all(&pool).unwrap();
     }
 }
