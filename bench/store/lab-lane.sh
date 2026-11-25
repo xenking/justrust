@@ -19,7 +19,7 @@ step() { # name args...
   echo "STEP lane=$L step=$n rc=$rc secs=$(( $(date +%s)-s )) t=$(date +%s)" >> $LAB/$V/steps.log
 }
 step initial test -p jcode-tui
-for i in $(seq 1 $C); do
+for i in $([ "$C" -gt 0 ] && seq 1 $C); do
   echo "// bench lane $L cycle $i" >> crates/jcode-tui/src/lib.rs
   step cycle$i test -p jcode-tui
 done

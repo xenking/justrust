@@ -61,7 +61,7 @@ so two worktrees in one target overwrite each other (FINDINGS 2026-10-10).
   acceptance) a stable dir.
 - **Leases** (`store::admit`): every local build takes a flock lease that
   reserves headroom (`check` 2 GB, `test` 4 GB, `build` 6 GB) against free
-  space less a floor (`JUSTRUST_DISK_MIN_FREE`, 2% of the volume, 6-24 GB). N
+  space less a floor (`JUSTRUST_DISK_MIN_FREE`, 1% of the volume, 4-12 GB). N
   builds starting together cannot each see the same free space. A build that
   does not fit reclaims once, then queues, printing why, up to
   `JUSTRUST_DISK_WAIT_MIN` (45), then runs anyway: never worse than before. A
@@ -90,11 +90,11 @@ so two worktrees in one target overwrite each other (FINDINGS 2026-10-10).
 
 ## Not done, and why
 
-- **Cross-worktree reuse of jcode's heavy crates.** `jcode_base`, `jcode_app_core`
-  and `jcode_tui` embed the workspace path (`CARGO_MANIFEST_DIR`), so the portable
-  guard correctly refuses to publish them. Portable mode stays opt-in
-  (`JUSTRUST_LOCALCACHE_PORTABLE=1`): measured 63 of 90 unit hits, none of the
-  expensive ones. A path-independent build of those crates is the lever.
+- **Cross-worktree reuse of jcode's heavy crates.** In the pilot, portable mode hit
+  63 of 90 local units in a second worktree, but not `jcode_base`, `jcode_app_core`
+  or `jcode_tui`, which hold about 70% of local compile time. Why they miss was
+  not established (the first two have no non-test `CARGO_MANIFEST_DIR`). Portable
+  stays opt-in (`JUSTRUST_LOCALCACHE_PORTABLE=1`).
 - **Single-flight of identical in-flight units** across simultaneous cold lanes.
 
 ## Commands

@@ -146,12 +146,12 @@ pub fn guard_enabled() -> bool {
 }
 
 /// Free space a build must leave on the volume: `JUSTRUST_DISK_MIN_FREE`
-/// (`20G`), else 2% of the volume clamped to 6-24 GiB.
+/// (`20G`), else 1% of the volume clamped to 4-12 GiB.
 pub fn min_free(total: u64) -> u64 {
     std::env::var("JUSTRUST_DISK_MIN_FREE")
         .ok()
         .and_then(|v| crate::depcache_gc::parse_size(&v))
-        .unwrap_or_else(|| (total / 50).clamp(6 * GIB, 24 * GIB))
+        .unwrap_or_else(|| (total / 100).clamp(4 * GIB, 12 * GIB))
 }
 
 /// Store-wide cap on the dependency and local-unit caches together
@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn fit_counts_other_reservations_and_the_free_floor() {
-        let total = 500 * GIB; // floor = 10 GiB
+        let total = 1000 * GIB; // floor = 10 GiB
         assert_eq!(min_free(total), 10 * GIB);
         assert_eq!(fit(100 * GIB, total, 0, 4 * GIB), Fit::Fits);
         assert_eq!(fit(14 * GIB, total, 0, 4 * GIB), Fit::Fits);
@@ -936,9 +936,10 @@ mod tests {
 
     #[test]
     fn min_free_scales_with_the_volume_within_bounds() {
-        assert_eq!(min_free(100 * GIB), 6 * GIB);
-        assert_eq!(min_free(500 * GIB), 10 * GIB);
-        assert_eq!(min_free(4000 * GIB), 24 * GIB);
+        assert_eq!(min_free(100 * GIB), 4 * GIB);
+        assert_eq!(min_free(500 * GIB), 5 * GIB);
+        assert_eq!(min_free(1000 * GIB), 10 * GIB);
+        assert_eq!(min_free(4000 * GIB), 12 * GIB);
     }
 
     #[test]
