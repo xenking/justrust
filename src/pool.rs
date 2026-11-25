@@ -86,7 +86,10 @@ pub fn resolve(cwd: &Path, name: &str) -> Option<PathBuf> {
     if !valid_name(name) {
         return None;
     }
-    resolve_in(&pool_root()?, &checkout_root(cwd), name)
+    let pool = pool_root()?;
+    let dir = resolve_in(&pool, &checkout_root(cwd), name)?;
+    crate::store::register_root("pool", &pool);
+    Some(dir)
 }
 
 fn resolve_in(pool: &Path, root: &Path, name: &str) -> Option<PathBuf> {
@@ -100,7 +103,6 @@ fn resolve_in(pool: &Path, root: &Path, name: &str) -> Option<PathBuf> {
     let tmp = kd.join(format!(".pool.json.{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_vec(&meta).ok()?).ok()?;
     std::fs::rename(&tmp, kd.join(".pool.json")).ok()?;
-    crate::store::register_root("pool", pool);
     Some(dir)
 }
 
@@ -240,6 +242,9 @@ fn remove_target(kd: &Path, name: &str, dir: &Path) -> bool {
     };
     let trash = kd.join(format!(".trash-{name}-{}", std::process::id()));
     let ok = std::fs::rename(dir, &trash).is_ok();
+    // Unlock explicitly: a child forked by another thread shares this open
+    // file until it execs and would keep the lock held after the drop.
+    let _ = lock.unlock();
     drop(lock);
     let _ = std::fs::remove_file(kd.join(format!("{name}.lock")));
     let _ = std::fs::remove_dir_all(&trash);
@@ -292,9 +297,10 @@ pub fn reclaim(pool: &Path, want: u64) -> u64 {
             return freed;
         }
         if now - meta.last_used >= 600.0
-            && let Some(_lock) = try_lock(&kd.join(format!("{name}.lock")))
+            && let Some(lock) = try_lock(&kd.join(format!("{name}.lock")))
         {
             freed += crate::slots::drop_incremental_in(dir);
+            let _ = lock.unlock();
         }
     }
     for (kd, name, dir, meta) in &all {
@@ -401,7 +407,10 @@ mod tests {
             std::fs::create_dir_all(&root).unwrap();
             let d = resolve_in(&pool, &root, "default").unwrap();
             std::fs::create_dir_all(d.join("debug/incremental/c")).unwrap();
-            std::fs::write(d.join("debug/incremental/c/s"), vec![2u8; 2 << 20]).unwrap();
+            let f = d.join("debug/incremental/c/s");
+            std::fs::write(&f, vec![2u8; 2 << 20]).unwrap();
+            // APFS reports private bytes only once the extents are allocated.
+            std::fs::File::open(&f).unwrap().sync_all().unwrap();
             std::fs::write(d.join("debug/libx.rlib"), b"r").unwrap();
             let m = Meta { root: root.to_string_lossy().into_owned(), last_used: paths::now() - idle };
             std::fs::write(d.parent().unwrap().join(".pool.json"), serde_json::to_vec(&m).unwrap()).unwrap();
