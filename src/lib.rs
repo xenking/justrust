@@ -44,6 +44,7 @@ mod nolocal;
 mod paths;
 mod peercache;
 mod platform_config;
+mod pool;
 mod prebuilt_proxy;
 mod procfs;
 mod profile;
@@ -346,6 +347,14 @@ enum Command {
         /// Internal: background GC of the slots under this dir.
         #[arg(long, hide = true)]
         gc_root: Option<PathBuf>,
+    },
+    /// Print the managed target dir for this checkout (created on first use).
+    /// Builds that need their own `--target-dir` use it so the dir is
+    /// accounted, reclaimed under disk pressure and removed with the checkout.
+    TargetDir {
+        /// Purpose of the dir: `default`, `verify`, `rollout`, ...
+        #[arg(long, default_value = "default")]
+        name: String,
     },
     /// Disk governor: free space, leases, store sizes (allocated and
     /// private), low-disk reclaim and retention.
@@ -1123,6 +1132,7 @@ fn command_name(c: &Command) -> Option<&'static str> {
         } => return None,
         Command::Slots { .. } => "slots",
         Command::Store { .. } => "store",
+        Command::TargetDir { .. } => "target-dir",
         Command::Cache { auto: true, .. } => return None,
         Command::Cache { .. } => "cache",
         Command::Early { .. } => "early",
@@ -1264,6 +1274,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             reclaim,
             retention,
         } => store::command(gc, reclaim, retention)?,
+        Command::TargetDir { name } => pool::command(&name)?,
         Command::Cache {
             prune,
             clear,

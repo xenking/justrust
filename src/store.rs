@@ -580,6 +580,12 @@ pub fn reclaim(want: u64) -> u64 {
             }
         }
     }
+    // 2b. Pool targets: idle ones' incremental dirs, then idle targets.
+    if freed < want
+        && let Some(pool) = crate::pool::pool_root().filter(|p| p.is_dir())
+    {
+        freed += crate::pool::reclaim(&pool, want - freed);
+    }
     // 3. Least recently used cache entries that free real space.
     if freed < want {
         freed += crate::depcache_gc::reclaim_lru(&roots, want - freed);
@@ -660,6 +666,9 @@ pub mod retention {
             }
         }
         // Churn and fact snapshots are recomputed from recorded runs.
+        let (pool_removed, pool_bytes) = crate::pool::sweep_default();
+        r.runs_removed += pool_removed;
+        r.runs_bytes += pool_bytes;
         r.hints_removed = remove_older(&home.join("split"), 30.0 * 86400.0, |n| {
             n.starts_with("churn-") || n.starts_with("facts-")
         });
@@ -862,6 +871,9 @@ pub fn command(gc: bool, reclaim_gb: Option<f64>, run_retention: bool) -> anyhow
     for root in registered_roots("slots") {
         let ns = crate::slots::root_summary(&root);
         println!("slots     {}  {}", root.display(), ns);
+    }
+    if let Some(pool) = crate::pool::pool_root().filter(|p| p.is_dir()) {
+        println!("pool      {}  {}", pool.display(), crate::pool::summary(&pool));
     }
     Ok(())
 }

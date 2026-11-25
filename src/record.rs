@@ -360,6 +360,9 @@ pub fn main(args: Vec<OsString>) -> ! {
 /// Record `cargo <args>` and exit with cargo's exit code.
 pub fn run(args: Vec<OsString>, opts: Options) -> ! {
     crate::e2e::mark("routed");
+    // JUSTRUST_POOL=1: a build that chose no target dir gets the checkout's
+    // managed one.
+    let args = crate::pool::with_target(args);
     let mut trace = PhaseTrace::new();
     if !should_record(&args) {
         exec_cargo(&args);
@@ -799,6 +802,7 @@ fn record(
     } else {
         None
     };
+    let _pool_hold = crate::pool::hold(args);
     let slot = opts.agent.then(|| slots::acquire(args)).flatten();
     let cargo_args = slot.as_ref().map_or(args, |s| s.args.as_slice());
     trace.mark("slot");

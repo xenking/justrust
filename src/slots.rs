@@ -1813,15 +1813,21 @@ fn drop_incremental(root: &Path, n: usize) -> u64 {
     let Some(lock) = try_lock(&root.join(format!("{n}.lock"))) else {
         return 0;
     };
+    let freed = drop_incremental_in(&root.join(n.to_string()));
+    drop(lock);
+    freed
+}
+
+/// Remove the incremental dirs under `target`; the caller holds its lock.
+pub(crate) fn drop_incremental_in(target: &Path) -> u64 {
     let mut freed = 0;
-    for dir in incremental_dirs(&root.join(n.to_string())) {
+    for dir in incremental_dirs(target) {
         freed += crate::store::dir_private(&dir);
         let trash = dir.with_file_name(format!(".incremental-trash-{}", std::process::id()));
         if std::fs::rename(&dir, &trash).is_ok() {
             let _ = std::fs::remove_dir_all(&trash);
         }
     }
-    drop(lock);
     freed
 }
 
