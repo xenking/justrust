@@ -219,16 +219,59 @@ pub fn now() -> f64 {
 /// Append one line to a file shared by concurrent writers. A single `write`
 /// on an `O_APPEND` file keeps lines from interleaving.
 pub fn append_line(path: &Path, line: &str) -> Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)?;
-    let mut buf = Vec::with_capacity(line.len() + 1);
+    let mut buf = Vec::with_capacity(line.len() + 2);
+    // A write cut short by ENOSPC or a kill leaves a last line without its
+    // newline. Appending straight after it would fuse our line into the torn
+    // one and lose both, so start on a fresh line.
+    let len = f.metadata()?.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1))?;
+        if f.read_exact(&mut last).is_ok() && last[0] != b'\n' {
+            buf.push(b'\n');
+        }
+    }
     buf.extend_from_slice(line.as_bytes());
     buf.push(b'\n');
     f.write_all(&buf)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod append_line_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn a_torn_last_line_does_not_swallow_the_next_append() {
+        let d = std::env::temp_dir().join(format!("jr-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("log.jsonl");
+        append_line(&p, r#"{"a":1}"#).unwrap();
+        // A write that died halfway: no closing brace, no newline.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(br#"{"a":2"#)
+            .unwrap();
+        append_line(&p, r#"{"a":3}"#).unwrap();
+        let ok: Vec<serde_json::Value> = std::fs::read_to_string(&p)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(ok.len(), 2, "the intact lines survive: {ok:?}");
+        assert_eq!(ok[1]["a"], 3);
+        std::fs::remove_dir_all(d).unwrap();
+    }
 }
 
 #[cfg(test)]
