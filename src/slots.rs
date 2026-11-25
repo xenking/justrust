@@ -1466,6 +1466,7 @@ fn acquire_with_probe_and_fs(
     }
     let root = target.join("justrust-slots");
     std::fs::create_dir_all(&root).ok()?;
+    crate::store::register_root("slots", &root);
     let can_seed = if non_reflink_fs(&root) {
         false
     } else {
@@ -1673,6 +1674,12 @@ fn slot_size(dir: &Path) -> Option<(u64, u64)> {
             return Some((excl, total));
         }
     }
+    // APFS: `du` counts every clone in full, so a slot seeded by `cp -c`
+    // "weighs" as much as the tree it cloned (40 GB listed, 6 GB private on
+    // the measured machine). The private bytes are what deleting it frees.
+    if cfg!(target_os = "macos") {
+        return Some((crate::store::dir_private(dir), crate::store::dir_alloc(dir)));
+    }
     // Apparent bytes (GNU `-b`); BSD du has no such flag: allocated KiB.
     let (flag, unit) = if cfg!(target_os = "macos") {
         ("-sk", 1024)
@@ -1779,9 +1786,60 @@ fn remove_slot(root: &Path, n: usize) -> bool {
     moved
 }
 
+/// Incremental dirs of a slot (`<profile>/incremental`, also one level
+/// deeper for `--target` builds). They are the largest bytes a slot owns
+/// privately (3.2 of 4.3 GB for a cold jcode test build) and the cheapest to
+/// lose: the next build only loses incremental reuse for crates it edits.
+fn incremental_dirs(slot: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for a in std::fs::read_dir(slot).into_iter().flatten().flatten() {
+        let a = a.path();
+        if a.join("incremental").is_dir() {
+            out.push(a.join("incremental"));
+        } else if a.is_dir() {
+            for b in std::fs::read_dir(&a).into_iter().flatten().flatten() {
+                if b.path().join("incremental").is_dir() {
+                    out.push(b.path().join("incremental"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Remove a free slot's incremental dirs. The slot's flock is held, so no
+/// build is using them. Returns the private bytes freed.
+fn drop_incremental(root: &Path, n: usize) -> u64 {
+    let Some(lock) = try_lock(&root.join(format!("{n}.lock"))) else {
+        return 0;
+    };
+    let mut freed = 0;
+    for dir in incremental_dirs(&root.join(n.to_string())) {
+        freed += crate::store::dir_private(&dir);
+        let trash = dir.with_file_name(format!(".incremental-trash-{}", std::process::id()));
+        if std::fs::rename(&dir, &trash).is_ok() {
+            let _ = std::fs::remove_dir_all(&trash);
+        }
+    }
+    drop(lock);
+    freed
+}
+
+/// Slots idle at least this long give up their incremental dirs when the
+/// budget is exceeded, before any whole slot is removed.
+const INCREMENTAL_IDLE: f64 = 3600.0;
+
 /// Garbage-collect the slots under `root`. Returns the removed slot numbers
-/// and the exclusive bytes they held.
+/// and the private bytes they held. Order: incremental dirs of idle slots
+/// first, then whole slots (idle past the max age, then least recently used)
+/// until the private bytes fit the budget.
 pub fn gc(root: &Path) -> (Vec<usize>, u64) {
+    let max_age = env_f64("JUSTRUST_SLOTS_MAX_AGE_DAYS", GC_MAX_AGE_DAYS) * 86400.0;
+    let budget = (env_f64("JUSTRUST_SLOTS_MAX_GB", GC_MAX_GB) * 1e9) as u64;
+    gc_with(root, max_age, budget)
+}
+
+fn gc_with(root: &Path, max_age: f64, budget: u64) -> (Vec<usize>, u64) {
     // Leftovers of an interrupted removal.
     for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
         if e.file_name().to_string_lossy().starts_with(".trash-") {
@@ -1791,7 +1849,7 @@ pub fn gc(root: &Path) -> (Vec<usize>, u64) {
     let now = paths::now();
     let ns = slot_numbers(root);
     let sizes = slot_sizes(root, &ns);
-    let slots: Vec<GcSlot> = ns
+    let mut slots: Vec<GcSlot> = ns
         .iter()
         .zip(sizes)
         .map(|(&n, size)| {
@@ -1806,9 +1864,25 @@ pub fn gc(root: &Path) -> (Vec<usize>, u64) {
             }
         })
         .collect();
-    let max_age = env_f64("JUSTRUST_SLOTS_MAX_AGE_DAYS", GC_MAX_AGE_DAYS) * 86400.0;
-    let budget = (env_f64("JUSTRUST_SLOTS_MAX_GB", GC_MAX_GB) * 1e9) as u64;
     let mut freed = 0;
+    // Stage 1: incremental state, least recently used slot first.
+    let mut used: u64 = slots.iter().map(|s| s.exclusive).sum();
+    if used > budget {
+        let mut idle: Vec<usize> = (0..slots.len())
+            .filter(|&i| !slots[i].in_use && slots[i].idle_secs >= INCREMENTAL_IDLE)
+            .collect();
+        idle.sort_by(|&a, &b| slots[b].idle_secs.total_cmp(&slots[a].idle_secs));
+        for i in idle {
+            if used <= budget {
+                break;
+            }
+            let got = drop_incremental(root, slots[i].n);
+            slots[i].exclusive = slots[i].exclusive.saturating_sub(got);
+            used = used.saturating_sub(got);
+            freed += got;
+        }
+    }
+    // Stage 2: whole slots.
     let mut removed = Vec::new();
     for n in gc_plan(&slots, max_age, budget) {
         if remove_slot(root, n) {
@@ -1817,6 +1891,63 @@ pub fn gc(root: &Path) -> (Vec<usize>, u64) {
         }
     }
     (removed, freed)
+}
+
+/// Low-disk reclaim of one slots root, called with the disk short rather
+/// than a budget exceeded: every idle slot gives up its incremental dirs
+/// (idle 10 min or more), then idle slots (30 min or more) are removed,
+/// least recently used first, until `want` private bytes are freed. A slot
+/// in use is never touched. Returns private bytes freed.
+pub fn reclaim(root: &Path, want: u64) -> u64 {
+    let now = paths::now();
+    let mut slots: Vec<(usize, f64)> = slot_numbers(root)
+        .into_iter()
+        .map(|n| {
+            let last = read_meta(&root.join(format!("{n}.json"))).map_or(0.0, |m| m.last_used);
+            (n, (now - last).max(0.0))
+        })
+        .collect();
+    slots.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut freed = 0;
+    for &(n, idle) in &slots {
+        if freed >= want {
+            return freed;
+        }
+        if idle >= 600.0 {
+            freed += drop_incremental(root, n);
+        }
+    }
+    for &(n, idle) in &slots {
+        if freed >= want {
+            break;
+        }
+        if idle >= 1800.0 {
+            let size = crate::store::dir_private(&root.join(n.to_string()));
+            if remove_slot(root, n) {
+                freed += size;
+            }
+        }
+    }
+    freed
+}
+
+/// One line for `justrust store`.
+pub fn root_summary(root: &Path) -> String {
+    let ns = slot_numbers(root);
+    let busy = ns
+        .iter()
+        .filter(|n| try_lock_probe(&root.join(format!("{n}.lock"))))
+        .count();
+    let private: u64 = ns
+        .iter()
+        .map(|n| crate::store::dir_private(&root.join(n.to_string())))
+        .sum();
+    format!(
+        "{} slot(s), {} in use, {} private",
+        ns.len(),
+        busy,
+        crate::store::gb(private)
+    )
 }
 
 /// After a run: start a detached GC of this workspace's slots if none ran
@@ -1901,6 +2032,7 @@ fn cached_sizes(root: &Path) -> Option<(f64, SizeMap)> {
 /// `justrust slots`: list the slots of the current workspace, or remove them.
 pub fn command(
     clean: bool,
+    min_idle: f64,
     run_gc: bool,
     du: bool,
     gc_root: Option<PathBuf>,
@@ -1948,7 +2080,13 @@ pub fn command(
         let meta = read_meta(&meta_path).unwrap_or_default();
         if clean {
             drop(lock);
-            if remove_slot(&root, i) {
+            let idle = (paths::now() - meta.last_used).max(0.0);
+            if idle < min_idle * 60.0 {
+                println!(
+                    "slot {i}: idle {}, kept (--idle-min {min_idle})",
+                    human_age(idle)
+                );
+            } else if remove_slot(&root, i) {
                 println!("slot {i}: removed");
             } else {
                 println!("slot {i}: in use, kept");
@@ -2601,6 +2739,69 @@ mod tests {
         // Slots used in the last hour are never reaped for budget.
         let slots = [s(0, 0.2, 50, false), s(1, 0.5, 50, false)];
         assert!(gc_plan(&slots, week, budget).is_empty());
+    }
+
+    fn slot_with_incremental(root: &Path, n: usize, idle_secs: f64, mb: usize) {
+        let inc = root.join(format!("{n}/debug/incremental/crate-abc"));
+        std::fs::create_dir_all(&inc).unwrap();
+        std::fs::write(inc.join("state.bin"), vec![5u8; mb << 20]).unwrap();
+        std::fs::create_dir_all(root.join(format!("{n}/debug/deps"))).unwrap();
+        std::fs::write(root.join(format!("{n}/debug/deps/libx.rlib")), b"rlib").unwrap();
+        let meta = SlotMeta {
+            owner: format!("s{n}"),
+            last_used: paths::now() - idle_secs,
+            seeded: true,
+            ..Default::default()
+        };
+        std::fs::write(root.join(format!("{n}.json")), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn gc_drops_incremental_dirs_of_idle_slots_before_any_slot() {
+        let root = std::env::temp_dir().join(format!("justrust-gc-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        slot_with_incremental(&root, 0, 5.0 * 3600.0, 3);
+        slot_with_incremental(&root, 1, 2.0 * 3600.0, 3);
+        // Idle only 5 minutes: some agent's warm cache.
+        slot_with_incremental(&root, 2, 300.0, 3);
+        // 9 MB of incremental state against a 7 MB budget: dropping the
+        // incremental dirs of the two idle slots is enough. No slot is removed.
+        let (removed, freed) = gc_with(&root, 30.0 * 86400.0, 7 << 20);
+        assert!(removed.is_empty(), "no whole slot goes while incremental can: {removed:?}");
+        assert!(freed >= 3 << 20);
+        assert!(!root.join("0/debug/incremental").exists());
+        // Oldest idle first, and it stops as soon as the budget fits.
+        assert!(root.join("1/debug/incremental").exists() || !root.join("2/debug/incremental").exists());
+        assert!(root.join("2/debug/incremental").exists(), "recently used slot keeps its incremental dir");
+        for n in 0..3 {
+            assert!(root.join(format!("{n}/debug/deps/libx.rlib")).exists());
+            assert!(root.join(format!("{n}.json")).exists());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reclaim_frees_idle_slots_but_never_one_in_use() {
+        let root = std::env::temp_dir().join(format!("justrust-reclaim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        slot_with_incremental(&root, 0, 3600.0, 2);
+        slot_with_incremental(&root, 1, 3600.0, 2);
+        slot_with_incremental(&root, 2, 30.0, 2);
+        let busy = try_lock(&root.join("1.lock")).unwrap();
+        let freed = reclaim(&root, 1);
+        assert!(freed >= 2 << 20, "{freed}");
+        assert!(!root.join("0/debug/incremental").exists());
+        assert!(root.join("1/debug/incremental").exists(), "in use");
+        assert!(root.join("2/debug/incremental").exists(), "idle under 10 minutes");
+        // Wanting more than incremental dirs can give: idle slots go whole,
+        // but not the busy one and not the one used 30 s ago.
+        let freed = reclaim(&root, u64::MAX);
+        assert!(freed > 0);
+        assert!(!root.join("0").exists());
+        assert!(root.join("1/debug/incremental").exists());
+        assert!(root.join("2/debug/incremental").exists());
+        drop(busy);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

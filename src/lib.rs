@@ -56,6 +56,7 @@ mod remote_agent;
 mod remote_windows;
 mod reuse;
 mod stock_verify;
+mod store;
 mod test_reuse;
 mod theoretical;
 // Build-host eviction runs on Unix hosts only.
@@ -328,9 +329,14 @@ enum Command {
     },
     /// List this workspace's per-agent build slots, or remove the free ones.
     Slots {
-        /// Remove every slot that is not in use.
+        /// Remove every slot that is not in use and idle for `--idle-min`.
         #[arg(long)]
         clean: bool,
+        /// With `--clean`: only slots idle at least this many minutes. A
+        /// free slot is often an agent's warm cache between commands, so the
+        /// default keeps recently used ones. `0` removes every free slot.
+        #[arg(long, value_name = "MIN", default_value_t = 30.0)]
+        idle_min: f64,
         /// Run the slot GC now (idle age and exclusive-size budget).
         #[arg(long)]
         gc: bool,
@@ -340,6 +346,22 @@ enum Command {
         /// Internal: background GC of the slots under this dir.
         #[arg(long, hide = true)]
         gc_root: Option<PathBuf>,
+    },
+    /// Disk governor: free space, leases, store sizes (allocated and
+    /// private), low-disk reclaim and retention.
+    Store {
+        /// Collect the dependency and local-unit caches now (caps, link
+        /// output expiry).
+        #[arg(long)]
+        gc: bool,
+        /// Free about this many GB now: idle link outputs, then idle slots'
+        /// incremental dirs and idle slots, then least recently used cache
+        /// entries that free real space.
+        #[arg(long, value_name = "GB")]
+        reclaim: Option<f64>,
+        /// Apply run-record and log retention now.
+        #[arg(long)]
+        retention: bool,
     },
     /// Show the shared dependency cache: size, entries, hit rate.
     Cache {
@@ -1100,6 +1122,7 @@ fn command_name(c: &Command) -> Option<&'static str> {
             gc_root: Some(_), ..
         } => return None,
         Command::Slots { .. } => "slots",
+        Command::Store { .. } => "store",
         Command::Cache { auto: true, .. } => return None,
         Command::Cache { .. } => "cache",
         Command::Early { .. } => "early",
@@ -1231,10 +1254,16 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         },
         Command::Slots {
             clean,
+            idle_min,
             gc,
             du,
             gc_root,
-        } => slots::command(clean, gc, du, gc_root)?,
+        } => slots::command(clean, idle_min, gc, du, gc_root)?,
+        Command::Store {
+            gc,
+            reclaim,
+            retention,
+        } => store::command(gc, reclaim, retention)?,
         Command::Cache {
             prune,
             clear,

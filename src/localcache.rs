@@ -622,7 +622,7 @@ fn unlink_copy(p: &Path) -> Option<bool> {
     Some(true)
 }
 
-fn max_bytes() -> u64 {
+pub(crate) fn max_bytes() -> u64 {
     std::env::var("JUSTRUST_LOCALCACHE_MAX")
         .ok()
         .and_then(|v| crate::depcache_gc::parse_size(&v))

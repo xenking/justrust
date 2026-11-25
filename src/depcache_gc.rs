@@ -101,6 +101,25 @@ struct Entry {
     path: PathBuf,
     bytes: u64,
     last_used: f64,
+    /// A linked executable or test binary: hundreds of MB, rarely hit, and
+    /// held as a clone of a file the next build overwrites. Collected on its
+    /// own, shorter clock (see `store::ephemeral_idle_secs`).
+    ephemeral: bool,
+}
+
+/// Smallest executable that counts as a link output worth its own policy.
+const EPHEMERAL_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Whether an entry holds a large executable (test binary, bin): a file with
+/// no extension, or `.exe`, at the top of the entry.
+fn is_ephemeral(dir: &Path) -> bool {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let exe = !name.starts_with('.')
+            && (name.ends_with(".exe") || (!name.contains('.') && name != "out"));
+        exe && e.metadata().is_ok_and(|m| m.is_file() && m.len() >= EPHEMERAL_MIN_BYTES)
+    })
 }
 
 #[derive(Debug, Default)]
@@ -155,10 +174,12 @@ fn inventory(root: &Path, mut on_partial: impl FnMut(&std::fs::DirEntry)) -> Sca
             .unwrap_or(0.0);
         let bytes = dir_bytes(&path);
         s.bytes += bytes;
+        let ephemeral = is_ephemeral(&path);
         s.entries.push(Entry {
             path,
             bytes,
             last_used,
+            ephemeral,
         });
     }
     for e in std::fs::read_dir(root.join("m"))
@@ -181,65 +202,246 @@ pub struct Pruned {
     pub bytes: u64,
 }
 
+/// Link outputs (executables, test binaries) are held by the store only as a
+/// convenience for a revert, so they are not given the durable grace.
+const EPHEMERAL_GRACE_SECS: f64 = 120.0;
+
+/// What a collection may take.
+#[derive(Debug, Clone)]
+pub struct Rules {
+    /// Size cap over all roots together (0 = none). Eviction stops at
+    /// `LOW_WATER` of it.
+    pub cap: u64,
+    /// Evict everything outside grace and pins.
+    pub all: bool,
+    /// Entries used this recently stay.
+    pub grace: f64,
+    /// Entries used at or after this time may be in use by a running build
+    /// (see `store::pin_floor`).
+    pub pin_floor: Option<f64>,
+    /// Idle link outputs older than this go regardless of the cap.
+    pub ephemeral_idle: f64,
+    /// Allocated bytes of link outputs the store keeps.
+    pub ephemeral_cap: u64,
+}
+
+impl Rules {
+    /// Routine collection under a cap, with the running builds' pins.
+    pub fn routine(cap: u64, all: bool) -> Rules {
+        Rules {
+            cap,
+            all,
+            grace: std::env::var("JUSTRUST_DEPCACHE_GRACE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(GRACE_SECS),
+            pin_floor: crate::store::pin_floor(),
+            ephemeral_idle: crate::store::ephemeral_idle_secs(),
+            ephemeral_cap: crate::store::ephemeral_cap(cap),
+        }
+    }
+}
+
 /// Evict least recently used entries until the cache is under `LOW_WATER`
 /// of `max` (or everything not in use, when `max` is 0 and `all` is set).
+/// Link outputs additionally expire on their own idle clock and cap.
 pub fn prune(root: &Path, max: u64, all: bool) -> Pruned {
-    let mut s = inventory(root, |e| {
-        // Half-written store from a crashed process: collect once stale.
-        if let Ok(m) = e.metadata()
-            && paths::now() - mtime(&m) > 3600.0
-        {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    });
-    let mut out = Pruned::default();
-    if !all && (max == 0 || s.bytes <= max) {
-        clear_trash(root);
-        return out;
-    }
-    let target = if all {
-        0
-    } else {
-        (max as f64 * LOW_WATER) as u64
+    prune_roots(&[root], &Rules::routine(max, all))
+}
+
+/// Move one entry into `trash/` and report whether it left. A restore that
+/// already opened a file keeps reading it, one that has not fails open.
+fn evict(root: &Path, e: &Entry) -> bool {
+    let Some(name) = e.path.file_name() else {
+        return false;
     };
-    s.entries
-        .sort_by(|a, b| a.last_used.total_cmp(&b.last_used));
     let trash = root.join("trash");
     let _ = std::fs::create_dir_all(&trash);
-    let now = paths::now();
-    let grace = std::env::var("JUSTRUST_DEPCACHE_GRACE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(GRACE_SECS);
-    for e in &s.entries {
-        if s.bytes <= target {
-            break;
-        }
-        if now - e.last_used < grace {
-            // Everything after this was used even more recently.
-            break;
-        }
-        let Some(name) = e.path.file_name() else {
-            continue;
-        };
-        let dst = trash.join(format!("{}.{}", name.to_string_lossy(), std::process::id()));
-        if std::fs::rename(&e.path, &dst).is_err() {
-            continue;
-        }
-        // Hit between scan and rename: put it back.
-        let touched = std::fs::metadata(dst.join("meta.json"))
-            .map(|m| mtime(&m) > e.last_used + 0.5)
-            .unwrap_or(false);
-        if touched && std::fs::rename(&dst, &e.path).is_ok() {
-            continue;
-        }
-        s.bytes = s.bytes.saturating_sub(e.bytes);
-        out.entries += 1;
-        out.bytes += e.bytes;
+    let dst = trash.join(format!("{}.{}", name.to_string_lossy(), std::process::id()));
+    if std::fs::rename(&e.path, &dst).is_err() {
+        return false;
     }
-    clear_trash(root);
-    drop_dead_manifest_lines(root);
+    // Hit between scan and rename: put it back.
+    let touched = std::fs::metadata(dst.join("meta.json"))
+        .map(|m| mtime(&m) > e.last_used + 0.5)
+        .unwrap_or(false);
+    !(touched && std::fs::rename(&dst, &e.path).is_ok())
+}
+
+/// One collection over every root, LRU across all of them.
+///
+/// Order: (1) idle link outputs, (2) link outputs over their own cap, (3)
+/// anything, least recently used first, until the roots together are under
+/// `LOW_WATER` of the cap. Entries inside the grace period or pinned by a
+/// running build's lease are skipped, not a reason to stop: a later entry
+/// can still be old enough.
+pub fn prune_roots(roots: &[&Path], rules: &Rules) -> Pruned {
+    let mut scans: Vec<Scan> = roots
+        .iter()
+        .map(|root| {
+            inventory(root, |e| {
+                // Half-written store from a crashed process: collect once stale.
+                if let Ok(m) = e.metadata()
+                    && paths::now() - mtime(&m) > 3600.0
+                {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            })
+        })
+        .collect();
+    let now = paths::now();
+    let mut out = Pruned::default();
+    // (root index, entry), oldest use first.
+    let mut all: Vec<(usize, Entry)> = scans
+        .iter_mut()
+        .enumerate()
+        .flat_map(|(i, s)| std::mem::take(&mut s.entries).into_iter().map(move |e| (i, e)))
+        .collect();
+    all.sort_by(|a, b| a.1.last_used.total_cmp(&b.1.last_used));
+    let mut total: u64 = scans.iter().map(|s| s.bytes).sum();
+    let mut eph: u64 = all.iter().filter(|(_, e)| e.ephemeral).map(|(_, e)| e.bytes).sum();
+    let mut gone = vec![false; all.len()];
+
+    let protected = |e: &Entry| {
+        let grace = if e.ephemeral { EPHEMERAL_GRACE_SECS } else { rules.grace };
+        now - e.last_used < grace || rules.pin_floor.is_some_and(|f| e.last_used >= f)
+    };
+    let mut take = |i: usize, total: &mut u64, eph: &mut u64, gone: &mut Vec<bool>| {
+        let (r, e) = &all[i];
+        if evict(roots[*r], e) {
+            gone[i] = true;
+            *total = total.saturating_sub(e.bytes);
+            if e.ephemeral {
+                *eph = eph.saturating_sub(e.bytes);
+            }
+            out.entries += 1;
+            out.bytes += e.bytes;
+        }
+    };
+
+    // 1. Link outputs nobody has needed for a while.
+    for i in 0..all.len() {
+        let e = &all[i].1;
+        if e.ephemeral && now - e.last_used > rules.ephemeral_idle && !protected(e) {
+            take(i, &mut total, &mut eph, &mut gone);
+        }
+    }
+    // 2. Link outputs over their own cap.
+    for i in 0..all.len() {
+        if eph <= rules.ephemeral_cap {
+            break;
+        }
+        let e = &all[i].1;
+        if !gone[i] && e.ephemeral && !protected(e) {
+            take(i, &mut total, &mut eph, &mut gone);
+        }
+    }
+    // 3. The cap.
+    let target = if rules.all {
+        0
+    } else if rules.cap == 0 {
+        u64::MAX
+    } else {
+        (rules.cap as f64 * LOW_WATER) as u64
+    };
+    if rules.all || (rules.cap != 0 && total > rules.cap) {
+        for i in 0..all.len() {
+            if total <= target {
+                break;
+            }
+            if !gone[i] && !protected(&all[i].1) {
+                take(i, &mut total, &mut eph, &mut gone);
+            }
+        }
+    }
+    for root in roots {
+        clear_trash(root);
+        drop_dead_manifest_lines(root);
+    }
     out
+}
+
+/// Smallest private size worth evicting in a low-disk reclaim: an entry that
+/// is a clone of a live target file frees nothing until that file goes.
+const RECLAIM_MIN_PRIVATE: u64 = 1024 * 1024;
+
+fn reclaim_in(roots: &[PathBuf], want: u64, ephemeral_only: bool) -> u64 {
+    let now = paths::now();
+    let mut all: Vec<(usize, Entry)> = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        all.extend(inventory(root, |_| {}).entries.into_iter().map(|e| (i, e)));
+    }
+    all.sort_by(|a, b| a.1.last_used.total_cmp(&b.1.last_used));
+    let mut freed = 0u64;
+    for (r, e) in &all {
+        if freed >= want {
+            break;
+        }
+        if (ephemeral_only && !e.ephemeral) || now - e.last_used < EPHEMERAL_GRACE_SECS {
+            continue;
+        }
+        // What deleting it frees now, not what it would weigh alone.
+        let private = crate::store::dir_private(&e.path);
+        if private < RECLAIM_MIN_PRIVATE {
+            continue;
+        }
+        if evict(&roots[*r], e) {
+            freed += private;
+        }
+    }
+    for root in roots {
+        clear_trash(root);
+        drop_dead_manifest_lines(root);
+    }
+    freed
+}
+
+/// Low-disk reclaim, cheapest first: idle link outputs.
+pub fn reclaim_ephemeral(roots: &[PathBuf], want: u64) -> u64 {
+    reclaim_in(roots, want, true)
+}
+
+/// Low-disk reclaim: least recently used entries that free real space.
+pub fn reclaim_lru(roots: &[PathBuf], want: u64) -> u64 {
+    reclaim_in(roots, want, false)
+}
+
+/// Cap for one root: the local-unit cache has its own, the rest follow the
+/// dependency cache's.
+pub fn root_cap(root: &Path) -> u64 {
+    if crate::localcache::cache_dir().is_some_and(|l| l == root) {
+        crate::localcache::max_bytes()
+    } else {
+        max_bytes()
+    }
+}
+
+/// Totals for `justrust store`: what the entries weigh as allocated blocks
+/// and what deleting them would free now.
+#[derive(Debug, Default)]
+pub struct PhysScan {
+    pub alloc: u64,
+    pub private: u64,
+    pub entries: usize,
+    pub ephemeral: usize,
+    pub ephemeral_alloc: u64,
+}
+
+pub fn scan_phys(root: &Path) -> PhysScan {
+    let s = scan(root);
+    let mut p = PhysScan {
+        alloc: s.bytes,
+        entries: s.entries.len(),
+        ..Default::default()
+    };
+    for e in &s.entries {
+        p.private += crate::store::dir_private(&e.path);
+        if e.ephemeral {
+            p.ephemeral += 1;
+            p.ephemeral_alloc += e.bytes;
+        }
+    }
+    p
 }
 
 fn clear_trash(root: &Path) {
@@ -335,7 +537,30 @@ fn auto(root: &Path) {
         return;
     };
     let start = paths::now();
-    let p = prune(root, max_bytes(), false);
+    let mut p = prune(root, max_bytes(), false);
+    // The store as a whole: depcache and local-unit cache under one cap, LRU
+    // across both, so neither can starve the other of the disk.
+    if paths::cache_namespace() == Ok(None)
+        && let Some(local) = crate::localcache::cache_dir().filter(|l| l.join("o").is_dir())
+    {
+        let cap = crate::store::store_cap(disk_space(root));
+        let both = prune_roots(&[root, &local], &Rules::routine(cap, false));
+        p.entries += both.entries;
+        p.bytes += both.bytes;
+    }
+    // Low disk: the volume, not the cap, is what a build dies on.
+    if crate::store::guard_enabled()
+        && let Some((free, total)) = disk_space(root)
+    {
+        let floor = crate::store::min_free(total);
+        if free < floor {
+            let freed = crate::store::reclaim(floor * 2 - free);
+            p.bytes += freed;
+        }
+    }
+    if crate::store::retention::due() {
+        crate::store::retention::run();
+    }
     if paths::cache_namespace() == Ok(None)
         && let Some(c) = paths::cache_root()
         && root == c.join("depcache")
@@ -742,6 +967,113 @@ mod tests {
         assert!(!old.exists());
         assert!(fresh.join("nested/data").is_file());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn exe_entry(root: &Path, key: &str, mb: usize, age_secs: f64) {
+        entry(root, key, 1, age_secs);
+        std::fs::write(root.join("o").join(key).join("app-0123abcd"), vec![9u8; mb << 20]).unwrap();
+    }
+
+    fn rules(cap: u64) -> Rules {
+        Rules {
+            cap,
+            all: false,
+            grace: 600.0,
+            pin_floor: None,
+            ephemeral_idle: 1800.0,
+            ephemeral_cap: u64::MAX,
+        }
+    }
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let r = std::env::temp_dir().join(format!("jr-gc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&r);
+        r
+    }
+
+    #[test]
+    fn idle_link_outputs_expire_without_a_cap_and_libraries_stay() {
+        let root = tmp_root("eph-idle");
+        exe_entry(&root, "testbin-old", 9, 7200.0);
+        exe_entry(&root, "testbin-new", 9, 60.0);
+        entry(&root, "lib-old", 100, 7200.0);
+        let p = prune_roots(&[&root], &rules(0));
+        assert_eq!(p.entries, 1, "{p:?}");
+        assert!(!root.join("o/testbin-old").exists(), "idle test binary expires");
+        assert!(root.join("o/testbin-new").exists(), "a recent one is a revert away");
+        assert!(root.join("o/lib-old").exists(), "libraries follow the cap, not the idle clock");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn link_outputs_over_their_own_cap_go_oldest_first() {
+        let root = tmp_root("eph-cap");
+        exe_entry(&root, "bin-a", 9, 1500.0);
+        exe_entry(&root, "bin-b", 9, 900.0);
+        exe_entry(&root, "bin-c", 9, 300.0);
+        entry(&root, "lib", 50, 1500.0);
+        let mut r = rules(0);
+        r.ephemeral_cap = 20 << 20;
+        let p = prune_roots(&[&root], &r);
+        assert_eq!(p.entries, 1, "{p:?}");
+        assert!(!root.join("o/bin-a").exists());
+        assert!(root.join("o/bin-b").exists() && root.join("o/bin-c").exists() && root.join("o/lib").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn entries_pinned_by_a_running_build_survive_a_tiny_cap() {
+        let root = tmp_root("pin");
+        let now = paths::now();
+        entry(&root, "before-build", 100, 7200.0);
+        entry(&root, "restored-by-build", 100, 1800.0);
+        let mut r = rules(1);
+        r.grace = 0.0;
+        // A build began an hour ago: whatever it used since is pinned.
+        r.pin_floor = Some(now - 3600.0);
+        prune_roots(&[&root], &r);
+        assert!(!root.join("o/before-build").exists());
+        assert!(root.join("o/restored-by-build").exists(), "pinned entry must not be evicted");
+        // Without the lease the same collection takes it.
+        r.pin_floor = None;
+        prune_roots(&[&root], &r);
+        assert!(!root.join("o/restored-by-build").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_cap_covers_two_roots_with_lru_across_both() {
+        let (a, b) = (tmp_root("two-a"), tmp_root("two-b"));
+        entry(&a, "a-old", 100, 9000.0);
+        entry(&b, "b-mid", 100, 8000.0);
+        entry(&a, "a-new", 100, 7000.0);
+        entry(&b, "b-new", 100, 6000.0);
+        // Room for two of four: the two oldest go, one from each root.
+        let p = prune_roots(&[&a, &b], &rules(250 * 1024));
+        assert_eq!(p.entries, 2, "{p:?}");
+        assert!(!a.join("o/a-old").exists() && !b.join("o/b-mid").exists());
+        assert!(a.join("o/a-new").exists() && b.join("o/b-new").exists());
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_partially_published_entry_is_never_an_inventory_entry_and_a_torn_tmp_is_collected() {
+        // Publish writes `.<key>.tmp<pid>` then renames, so a build killed or
+        // out of space midway leaves only a dot-dir: invisible to restore,
+        // collected once stale.
+        let root = tmp_root("torn");
+        entry(&root, "good", 10, 100.0);
+        let torn = root.join("o/.deadbeef.tmp4242");
+        std::fs::create_dir_all(&torn).unwrap();
+        std::fs::write(torn.join("libhalf.rlib"), b"half").unwrap();
+        assert_eq!(scan(&root).entries.len(), 1);
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(&torn).unwrap().set_modified(stale).unwrap();
+        prune_roots(&[&root], &rules(0));
+        assert!(!torn.exists());
+        assert!(root.join("o/good").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

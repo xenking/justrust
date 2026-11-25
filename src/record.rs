@@ -781,6 +781,24 @@ fn record(
         std::thread::spawn(move || crate::sched::enter(&id))
     };
     // Agent runs get a private target dir so parallel agents do not block.
+    // Queue here, before any bytes are written, when the volume is too full
+    // for this build on top of the ones already running: a build that does
+    // not fit waits instead of dying with ENOSPC. Held until the run ends.
+    let disk_sub = subcommand(args);
+    let _disk_lease = if matches!(
+        disk_sub.as_deref(),
+        Some("check" | "c" | "test" | "t" | "build" | "b" | "clippy" | "run" | "r" | "bench")
+    ) {
+        let sub = disk_sub.unwrap_or_default();
+        crate::store::admit(
+            &std::env::current_dir().unwrap_or_default(),
+            &sub,
+            crate::store::reserve_for(&sub),
+            &mut std::io::stderr().lock(),
+        )
+    } else {
+        None
+    };
     let slot = opts.agent.then(|| slots::acquire(args)).flatten();
     let cargo_args = slot.as_ref().map_or(args, |s| s.args.as_slice());
     trace.mark("slot");
