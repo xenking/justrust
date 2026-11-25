@@ -39,6 +39,12 @@ the second build in each lane waited for its reservation, and after 30 s the
 waiting build reclaimed its idle neighbours' incremental dirs (the next cycle of
 lane 2 took 208 s instead of 66 s, rebuilding that state).
 
+Re-run with the final binary (after the local-unit stamp fix, which makes the
+cache publish many more units): peak +11.97 GB, final +11.31 GB, growth over the
+8 cycles +0.82 GB, 0 failed steps, wall 676 s (the machine was about 1.6x slower
+than during the first runs: the same warm-up took 288 s instead of 174 s).
+The disk result held.
+
 ## E2. Squeeze: 3 lanes, one cold build each, 11.7 GB free
 
 | | before (0.1.58) | after (fork) |
