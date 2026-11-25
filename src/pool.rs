@@ -58,15 +58,18 @@ struct Meta {
 
 /// The checkout a build belongs to: the git toplevel, else the directory.
 fn checkout_root(cwd: &Path) -> PathBuf {
-    let top = std::process::Command::new("git")
+    git_top(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn git_top(cwd: &Path) -> Option<PathBuf> {
+    std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    top.unwrap_or_else(|| cwd.to_path_buf())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
 }
 
 fn key_dir(pool: &Path, root: &Path) -> PathBuf {
@@ -146,7 +149,7 @@ fn user_chose_target(args: &[OsString]) -> bool {
 /// the git toplevel) whose Cargo.toml has a `[workspace]`, else the nearest
 /// ancestor with a Cargo.toml.
 fn workspace_root(cwd: &Path) -> Option<PathBuf> {
-    let top = checkout_root(cwd);
+    let top = git_top(cwd);
     let mut nearest = None;
     let mut best = None;
     for d in cwd.ancestors() {
@@ -156,7 +159,7 @@ fn workspace_root(cwd: &Path) -> Option<PathBuf> {
                 best = Some(d.to_path_buf());
             }
         }
-        if d == top {
+        if top.as_deref() == Some(d) {
             break;
         }
     }
