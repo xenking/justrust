@@ -458,10 +458,15 @@ fn run_job(inner: &Arc<Inner>, job: Job) {
                 };
                 fin.hide_filtered = g.hide_filtered;
                 let overlapped = inner.state.lock().unwrap().overlapped.contains(&job.id);
-                if should_confirm(fin.exit, overlapped, cancellation_signal()) {
+                // A process that died is not a flaky test: rerunning names alone
+                // would hide that its remaining tests never ran.
+                if crash_reason(&fin).is_none()
+                    && should_confirm(fin.exit, overlapped, cancellation_signal())
+                {
                     // It ran next to other test processes: confirm alone.
                     fin = confirm_alone(inner, &job.req, &job.stem, &g.args, fin);
                 }
+                mark_crash(&mut fin);
                 report(inner, &fin);
                 let mut st = inner.state.lock().unwrap();
                 if fin.exit != 0 && inner.fail_fast {
@@ -759,7 +764,8 @@ fn confirm_alone(
                         paths::now(),
                         "e",
                         format!(
-                            "justrust: {stem}: {} failed while other test processes ran in parallel and passed when rerun alone by name; not counted as failures",
+                            "justrust: {stem}: {} tests failed in parallel and passed alone: {}",
+                            flaky.len(),
                             flaky.join(", ")
                         )
                         .into_bytes(),
@@ -823,6 +829,95 @@ fn confirm_alone(
         alone.lines.push((paths::now(), "e", note.into_bytes()));
     }
     alone
+}
+
+/// Marker the summary parses: `justrust: crashed: <binary>: <why>; N tests did not run`.
+pub const CRASH_PREFIX: &str = "justrust: crashed: ";
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        _ => "signal",
+    }
+}
+
+fn line_text(l: &(f64, &'static str, Vec<u8>)) -> String {
+    String::from_utf8_lossy(&l.2).trim().to_owned()
+}
+
+/// Why a finished process is a crash rather than a test failure: libtest exits
+/// 0 or 101 and always prints a `test result:` line. Anything else (a signal,
+/// an abort, another status, or no summary) means tests were lost.
+fn crash_reason(f: &Finished) -> Option<String> {
+    let summary = f.lines.iter().any(|l| {
+        line_text(l).starts_with("test result: ") || line_text(l).contains("test result: ")
+    });
+    if (f.exit == 0 || f.exit == 101) && summary {
+        return None;
+    }
+    let how = if f.exit > 128 {
+        let sig = f.exit - 128;
+        format!("died by signal {sig} ({})", signal_name(sig))
+    } else {
+        format!("exited with status {}", f.exit)
+    };
+    Some(if summary {
+        how
+    } else {
+        format!("{how} before its test summary")
+    })
+}
+
+/// How many of the tests libtest announced (`running N tests`) never reported.
+fn tests_not_run(f: &Finished) -> u64 {
+    let announced = f
+        .lines
+        .iter()
+        .find_map(|l| {
+            let t = line_text(l);
+            t.strip_prefix("running ")?
+                .strip_suffix(" tests")
+                .or_else(|| t.strip_prefix("running ")?.strip_suffix(" test"))?
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(0);
+    let reported = f
+        .lines
+        .iter()
+        .filter(|l| {
+            let t = line_text(l);
+            t.starts_with("test ")
+                && [" ... ok", " ... FAILED", " ... ignored"]
+                    .iter()
+                    .any(|s| t.contains(s))
+        })
+        .count() as u64;
+    announced.saturating_sub(reported)
+}
+
+/// Report a crash loudly and make sure the process counts as failed.
+fn mark_crash(f: &mut Finished) {
+    let Some(why) = crash_reason(f) else {
+        return;
+    };
+    if f.exit == 0 {
+        f.exit = 1;
+    }
+    let msg = format!(
+        "{CRASH_PREFIX}{}: {why}; {} tests did not run",
+        f.stem,
+        tests_not_run(f)
+    );
+    f.lines.push((paths::now(), "e", msg.into_bytes()));
 }
 
 fn failed_names(f: &Finished) -> Vec<&str> {
@@ -1468,6 +1563,99 @@ mod tests {
         );
         assert_eq!(h.exit, 0);
         assert!(failed_names(&h).is_empty());
+    }
+
+    fn finished(exit: i32, lines: &[&str]) -> Finished {
+        Finished {
+            bin: "b".into(),
+            stem: "b-1".into(),
+            exit,
+            start: 0.0,
+            end: 1.0,
+            lines: lines
+                .iter()
+                .map(|t| (0.0, "o", t.as_bytes().to_vec()))
+                .collect(),
+            outcomes: Vec::new(),
+            hide_filtered: None,
+        }
+    }
+
+    const SUMMARY_OK: &str = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s";
+    const SUMMARY_FAILED: &str = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s";
+
+    #[test]
+    fn a_clean_pass_and_a_real_failure_are_not_crashes() {
+        assert_eq!(
+            crash_reason(&finished(0, &["running 2 tests", SUMMARY_OK])),
+            None
+        );
+        assert_eq!(
+            crash_reason(&finished(101, &["running 2 tests", SUMMARY_FAILED])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_process_killed_by_sigpipe_mid_run_is_a_crash_with_its_lost_tests_counted() {
+        let mut f = finished(
+            128 + 13,
+            &["running 4 tests", "test a ... ok", "test b ... FAILED"],
+        );
+        assert_eq!(
+            crash_reason(&f).as_deref(),
+            Some("died by signal 13 (SIGPIPE) before its test summary")
+        );
+        assert_eq!(tests_not_run(&f), 2);
+        mark_crash(&mut f);
+        let last = line_text(f.lines.last().unwrap());
+        assert_eq!(
+            last,
+            "justrust: crashed: b-1: died by signal 13 (SIGPIPE) before its test summary; 2 tests did not run"
+        );
+        assert_eq!(f.exit, 141);
+    }
+
+    #[test]
+    fn exiting_without_a_summary_is_a_crash_even_with_status_zero() {
+        let mut f = finished(0, &["running 3 tests", "test a ... ok"]);
+        assert!(
+            crash_reason(&f)
+                .unwrap()
+                .contains("before its test summary")
+        );
+        mark_crash(&mut f);
+        assert_ne!(f.exit, 0);
+        assert!(crash_reason(&finished(3, &["running 1 test", SUMMARY_OK])).is_some());
+    }
+
+    #[test]
+    fn a_flaky_failure_is_still_forgiven_only_as_an_explicit_line() {
+        let mut f = finished(
+            101,
+            &[
+                "running 2 tests",
+                "test a ... FAILED",
+                "test b ... ok",
+                SUMMARY_FAILED,
+            ],
+        );
+        f.outcomes = vec![
+            TestOutcome {
+                name: "a".into(),
+                passed: false,
+                secs: None,
+            },
+            TestOutcome {
+                name: "b".into(),
+                passed: true,
+                secs: None,
+            },
+        ];
+        assert!(crash_reason(&f).is_none());
+        let g = drop_failures(f, &["a"]);
+        assert_eq!(g.exit, 0);
+        assert!(crash_reason(&g).is_none());
     }
 
     #[test]

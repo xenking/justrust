@@ -316,6 +316,12 @@ pub struct TestStats {
     pub failed: u64,
     pub ignored: u64,
     pub filtered_out: u64,
+    /// Test processes that died or exited without a summary, and the tests
+    /// they announced but never reported.
+    #[serde(default)]
+    pub crashed: u64,
+    #[serde(default)]
+    pub not_run: u64,
     /// libtest's own "finished in" total.
     pub libtest_secs: f64,
     /// The slowest individual tests, slowest first (needs per-test times from
@@ -327,6 +333,16 @@ pub struct TestStats {
     pub timed_secs: f64,
     #[serde(default)]
     pub timed: u64,
+}
+
+/// `justrust: crashed: <binary>: <why>; N tests did not run` from the test pool.
+fn parse_crash_line(text: &str) -> Option<u64> {
+    let rest = text.trim().strip_prefix(crate::test_pool::CRASH_PREFIX)?;
+    rest.rsplit_once("; ")?
+        .1
+        .strip_suffix(" tests did not run")?
+        .parse()
+        .ok()
 }
 
 impl TestStats {
@@ -927,6 +943,9 @@ pub fn build(
                 start: rel(l.t),
                 ..Default::default()
             });
+        } else if let Some(lost) = parse_crash_line(text) {
+            tests.crashed += 1;
+            tests.not_run += lost;
         } else if let Some((name, secs, passed)) = crate::test_runner::parse_timed_line(text) {
             tests.timed += 1;
             tests.timed_secs += secs;
@@ -1527,6 +1546,18 @@ impl Summary {
                     ""
                 } else {
                     "s"
+                }
+            )
+        } else if self.tests.crashed > 0 {
+            format!(
+                "FAILED: {} test process{} crashed, {} tests did not run{}",
+                self.tests.crashed,
+                if self.tests.crashed == 1 { "" } else { "es" },
+                self.tests.not_run,
+                if self.tests.failed > 0 {
+                    format!("; {} more failed", self.tests.failed)
+                } else {
+                    String::new()
                 }
             )
         } else if self.tests.failed > 0 {

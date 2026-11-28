@@ -5,6 +5,7 @@ All notable changes. Versions follow [semver](https://semver.org); while in
 
 ## Unreleased
 
+- A test process that dies by a signal, exits with a status other than 0 or 101, or exits without a `test result:` line is a crash: it is reported as FAILED with the binary and signal, its lost tests are counted ("N tests did not run"), and the rerun-alone logic never forgives it. Flaky failures forgiven by a rerun are reported as `N tests failed in parallel and passed alone: <names>`.
 - Hosted failure telemetry now correlates failures with their run ID, including
   speculative `-pre` runs, and reports a fixed transport cause and last reached
   phase instead of only `remote_transport`. Typed I/O and malformed-frame causes
