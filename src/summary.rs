@@ -422,6 +422,12 @@ pub struct TestStats {
     pub failed: u64,
     pub ignored: u64,
     pub filtered_out: u64,
+    /// Test processes that died or exited without a summary, and the tests
+    /// they announced but never reported.
+    #[serde(default)]
+    pub crashed: u64,
+    #[serde(default)]
+    pub not_run: u64,
     /// libtest's own "finished in" total.
     pub libtest_secs: f64,
     /// The slowest individual tests, slowest first (needs per-test times from
@@ -433,6 +439,16 @@ pub struct TestStats {
     pub timed_secs: f64,
     #[serde(default)]
     pub timed: u64,
+}
+
+/// `justrust: crashed: <binary>: <why>; N tests did not run` from the test pool.
+fn parse_crash_line(text: &str) -> Option<u64> {
+    let rest = text.trim().strip_prefix(crate::test_pool::CRASH_PREFIX)?;
+    rest.rsplit_once("; ")?
+        .1
+        .strip_suffix(" tests did not run")?
+        .parse()
+        .ok()
 }
 
 impl TestStats {
@@ -1132,6 +1148,9 @@ pub fn build(
                 start: rel(l.t),
                 ..Default::default()
             });
+        } else if let Some(lost) = parse_crash_line(text) {
+            tests.crashed += 1;
+            tests.not_run += lost;
         } else if let Some((name, secs, passed)) = crate::test_runner::parse_timed_line(text) {
             tests.timed += 1;
             tests.timed_secs += secs;
@@ -1914,6 +1933,18 @@ impl Summary {
                     ""
                 } else {
                     "s"
+                }
+            )
+        } else if self.tests.crashed > 0 {
+            format!(
+                "FAILED: {} test process{} crashed, {} tests did not run{}",
+                self.tests.crashed,
+                if self.tests.crashed == 1 { "" } else { "es" },
+                self.tests.not_run,
+                if self.tests.failed > 0 {
+                    format!("; {} more failed", self.tests.failed)
+                } else {
+                    String::new()
                 }
             )
         } else if self.tests.failed > 0 {
@@ -3419,5 +3450,26 @@ mod tests {
         assert!(is_compile_error(
             "error: cannot find value `x` in this scope"
         ));
+    }
+
+    #[test]
+    fn a_crashed_test_process_is_the_verdict_and_states_how_many_tests_did_not_run() {
+        assert_eq!(
+            parse_crash_line(
+                "justrust: crashed: app-1: died by signal 13 (SIGPIPE) before its test summary; 287 tests did not run"
+            ),
+            Some(287)
+        );
+        assert_eq!(parse_crash_line("test a ... ok"), None);
+        let mut s = Summary::default();
+        s.exit = 101;
+        s.tests.passed = 14165;
+        s.tests.crashed = 1;
+        s.tests.not_run = 287;
+        let footer = s.agent_footer(&Default::default());
+        assert!(
+            footer.contains("FAILED: 1 test process crashed, 287 tests did not run"),
+            "{footer}"
+        );
     }
 }
