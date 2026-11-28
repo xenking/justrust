@@ -560,7 +560,8 @@ pub fn command(action: &str, force: bool) -> Result<()> {
         }
         "status" => {
             println!(
-                "justrust {VERSION} ({}), {}",
+                "justrust {} ({}), {}",
+                crate::DISPLAY_VERSION,
                 if release_build() {
                     "release build"
                 } else {

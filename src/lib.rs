@@ -168,8 +168,17 @@ Examples:
 Human terminal UI (explicit opt-in, never used by build/status commands):
   justrust interactive dashboard";
 
+/// What `--version` and `update status` print. A fork build sets
+/// `JUSTRUST_FORK_VERSION` (e.g. `0.1.78+fork.<sha>`) at compile time so it is
+/// never mistaken for the upstream release of the same version. The protocol
+/// version everything else uses stays `CARGO_PKG_VERSION`.
+pub const DISPLAY_VERSION: &str = match option_env!("JUSTRUST_FORK_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "justrust", version, about, after_help = AFTER_HELP)]
+#[command(name = "justrust", version = DISPLAY_VERSION, about, after_help = AFTER_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
