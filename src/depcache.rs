@@ -290,6 +290,9 @@ pub struct Plan {
     /// crates that `include!` generated `OUT_DIR` files are the same in
     /// every target dir and on every machine.
     pub extra_args: Vec<String>,
+    /// Workspace-valued `[env]` variables left out of a dependency's key
+    /// (`workspace_config_env`), with this build's values.
+    pub(crate) unkeyed_env: Vec<(String, String)>,
 }
 
 /// Fixed path the target dir is remapped to in dependency outputs.
@@ -424,11 +427,12 @@ fn is_unit_out_dir(out_dir: &Path) -> bool {
 
 /// Report inherited key names that can distinguish a unit from producers with
 /// a different environment. Presence alone does not establish why it missed.
+/// Only dependency units report it, so the names follow their key.
 pub(crate) fn user_keyed_env(env: &[(String, String)]) -> Vec<String> {
     let mut v: Vec<String> = env
         .iter()
         .map(|(k, _)| k.as_str())
-        .filter(|k| keyed_env(k) && !cargo_sets(k))
+        .filter(|k| dep_keyed_env(k) && !cargo_sets(k))
         .map(str::to_owned)
         .collect();
     v.sort();
@@ -445,6 +449,7 @@ fn cargo_sets(k: &str) -> bool {
             k,
             "CARGO"
                 | "CARGO_CRATE_NAME"
+                | "CARGO_RUSTC_CURRENT_DIR"
                 | "CARGO_MANIFEST_DIR"
                 | "CARGO_MANIFEST_PATH"
                 | "CARGO_MANIFEST_LINKS"
@@ -493,6 +498,27 @@ pub(crate) fn keyed_env(name: &str) -> bool {
             name,
             "OUT_DIR" | "SOURCE_DATE_EPOCH" | "LIBRARY_PATH" | "SDKROOT" | "RUST_TARGET_PATH"
         )
+}
+
+/// Variables a project's `[env]` configuration points at its own checkout
+/// (`NAME = { value = "", relative = true }`): the `CARGO_WORKSPACE_DIR`
+/// idiom, and `CARGO_RUSTC_CURRENT_DIR` as Cargo's own repository and rustc's
+/// bootstrap set it. Cargo passes `[env]` to every rustc it runs, so keying
+/// them gave every registry dependency a new key in each checkout: 755 units
+/// and 334s of dependency compiles in 24h of hosted runs (2026-11-25), 29% of
+/// all dependency miss time, had `depcache_why` name `CARGO_RUSTC_CURRENT_DIR`.
+/// A dependency that reads one through `env!`/`option_env!` has it in
+/// dep-info, and restore checks that value (`Entry::env`). One that carries
+/// the path without declaring it is not stored (`Plan::store`).
+pub(crate) fn workspace_config_env(name: &str) -> bool {
+    matches!(name, "CARGO_RUSTC_CURRENT_DIR" | "CARGO_WORKSPACE_DIR")
+}
+
+/// Env vars in a dependency unit's base key. Local units key the
+/// workspace-valued ones too (as a placeholder when portable): their macros
+/// do read them.
+pub(crate) fn dep_keyed_env(name: &str) -> bool {
+    keyed_env(name) && !workspace_config_env(name)
 }
 
 /// Cargo configuration in the environment (`CARGO_PROFILE_*`,
@@ -668,9 +694,100 @@ pub(crate) fn rustc_version(real: &Path) -> Option<String> {
     {
         return v.clone();
     }
-    let v = rustc_version_uncached(real);
+    let v = rustc_version_on_disk(real, paths::cache_root().as_deref());
     *memo = Some((real.to_path_buf(), v.clone()));
     v
+}
+
+/// `rustc -vV`, remembered on disk per compiler identity. Every unit runs in
+/// its own shim process, so without this each unit started a compiler just
+/// to compute its key (18 ms each on the build hosts, 4 s of job time over
+/// the 362 units of a Cargo check that hit the cache for all of them).
+fn rustc_version_on_disk(real: &Path, cache_root: Option<&Path>) -> Option<String> {
+    let file = rustc_identity(real).and_then(|id| {
+        let mut h = H128::new();
+        h.field(b"rustc-vV-v1");
+        h.field(id.as_bytes());
+        Some(cache_root?.join("rustc-version").join(h.hex()))
+    });
+    if let Some(f) = &file
+        && let Ok(v) = std::fs::read_to_string(f)
+        && v.starts_with("rustc ")
+        && v.ends_with('\n')
+    {
+        return Some(v);
+    }
+    let v = rustc_version_uncached(real)?;
+    if let Some(f) = &file
+        && v.starts_with("rustc ")
+        && v.ends_with('\n')
+        && let Some(dir) = f.parent()
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        // Atomic: a concurrent shim reads the whole text or nothing.
+        let tmp = dir.join(format!(".tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, &v).is_err() || std::fs::rename(&tmp, f).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Some(v)
+}
+
+/// What decides a compiler's `-vV` output without running it: the resolved
+/// binary and the compiler library beside it (a toolchain's `rustc` is a
+/// small launcher for `librustc_driver`), each by size and times. `None`
+/// (ask the compiler every time) for a rustup proxy, whose answer depends
+/// on the directory and environment, and for anything unreadable.
+fn rustc_identity(real: &Path) -> Option<String> {
+    fn stamp(p: &Path) -> Option<String> {
+        let m = std::fs::metadata(p).ok()?;
+        let t = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+        };
+        #[cfg(unix)]
+        let changed = {
+            use std::os::unix::fs::MetadataExt;
+            (m.ctime(), m.ctime_nsec(), m.ino())
+        };
+        #[cfg(not(unix))]
+        let changed = t(m.created());
+        Some(format!(
+            "{}|{}|{:?}|{changed:?}",
+            p.display(),
+            m.len(),
+            t(m.modified())?
+        ))
+    }
+    let bin = real.canonicalize().ok()?;
+    if bin.file_stem()?.to_str()? == "rustup" {
+        return None;
+    }
+    // A script can start any compiler: only a native binary is its own answer.
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut std::fs::File::open(&bin).ok()?, &mut magic).ok()?;
+    if !matches!(
+        &magic,
+        b"\x7fELF" | b"\xcf\xfa\xed\xfe" | b"\xca\xfe\xba\xbe" | b"MZ\x90\x00"
+    ) {
+        return None;
+    }
+    let mut id = vec![stamp(&bin)?];
+    for dir in ["lib", "bin"] {
+        let Ok(rd) = std::fs::read_dir(bin.parent()?.parent()?.join(dir)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("librustc_driver") || name.starts_with("rustc_driver") {
+                id.push(stamp(&e.path())?);
+            }
+        }
+    }
+    id.sort();
+    Some(id.join("\n"))
 }
 
 fn rustc_version_uncached(real: &Path) -> Option<String> {
@@ -793,7 +910,29 @@ pub(crate) fn plan_with(
     }) {
         h.field(libc_family().as_bytes());
     }
-    let mut env: Vec<&(String, String)> = env.iter().filter(|(k, _)| keyed_env(k)).collect();
+    let dependency = local.is_none();
+    // Checked against outputs when stored, unless the key names the checkout
+    // anyway (a vendored source's working dir is inside it).
+    let unkeyed_env: Vec<(String, String)> = env
+        .iter()
+        .filter(|(k, v)| {
+            dependency
+                && workspace_config_env(k)
+                && Path::new(v).is_absolute()
+                && !cwd.starts_with(v)
+        })
+        .cloned()
+        .collect();
+    let mut env: Vec<&(String, String)> = env
+        .iter()
+        .filter(|(k, _)| {
+            if dependency {
+                dep_keyed_env(k)
+            } else {
+                keyed_env(k)
+            }
+        })
+        .collect();
     env.sort();
     for (k, v) in &env {
         h.field(k.as_bytes());
@@ -818,6 +957,7 @@ pub(crate) fn plan_with(
         norm,
         root,
         extra_args,
+        unkeyed_env,
     })
 }
 
@@ -950,11 +1090,11 @@ pub(crate) fn key_args_with(
             key_codegen(v, norm, cwd, h)?;
         } else if a == "-L" {
             h.field(b"-L");
-            key_lib_dir(next?, norm, cwd, h)?;
+            key_lib_dir(next?, norm, cwd, !meta_only, h)?;
             i += 1;
         } else if let Some(v) = a.strip_prefix("-L") {
             h.field(b"-L");
-            key_lib_dir(v, norm, cwd, h)?;
+            key_lib_dir(v, norm, cwd, !meta_only, h)?;
         } else {
             h.field(norm.norm(a).as_bytes());
         }
@@ -1315,8 +1455,21 @@ fn key_codegen(v: &str, norm: &Norm, cwd: &Path, h: &mut H128) -> Option<()> {
 
 /// Native library dirs inside the target dir (build-script output such as a
 /// `cc`-built `libfoo.a`) get bundled into rlibs, so their content is keyed.
-pub(crate) fn key_lib_dir(v: &str, norm: &Norm, cwd: &Path, h: &mut H128) -> Option<()> {
+/// Metadata-only builds (`--emit=dep-info,metadata`, i.e. `cargo check` /
+/// `clippy`) never bundle native archives into `.rmeta`, so `hash_files` is
+/// false for them: otherwise crates like `ring` and `wayland-backend` miss
+/// across machines whenever `cc` produces different `.a` bytes.
+pub(crate) fn key_lib_dir(
+    v: &str,
+    norm: &Norm,
+    cwd: &Path,
+    hash_files: bool,
+    h: &mut H128,
+) -> Option<()> {
     h.field(norm.norm(v).as_bytes());
+    if !hash_files {
+        return Some(());
+    }
     let (kind, path) = v.split_once('=').unwrap_or(("all", v));
     if kind == "dependency" {
         return Some(());
@@ -1702,10 +1855,24 @@ impl Plan {
             .map(|(p, _)| self.norm.denorm(p))
             .filter(|p| p.starts_with(&self.norm.target))
             .collect();
+        // An unkeyed workspace path the unit did not declare reading
+        // (dep-info) must not be in its outputs either.
+        let undeclared: Vec<&(String, String)> = self
+            .unkeyed_env
+            .iter()
+            .filter(|(k, _)| entry.env.iter().all(|(n, _)| n != k))
+            .collect();
         for name in files.iter().filter(|n| !n.ends_with(".d")) {
             let bytes = std::fs::read(self.out_dir.join(name)).ok()?;
             if !target_refs_are_inputs(&bytes, &self.norm.target, &input_paths) {
                 self.explain_refusal(&format!("{name} names the target dir"));
+                return None;
+            }
+            if let Some((k, _)) = undeclared
+                .iter()
+                .find(|(_, v)| names_path_outside(&bytes, v, &self.norm.target))
+            {
+                self.explain_refusal(&format!("{name} names the unkeyed {k}"));
                 return None;
             }
         }
@@ -1813,6 +1980,31 @@ pub(crate) fn target_refs_are_inputs(bytes: &[u8], target: &str, inputs: &[Strin
         i = at + 1;
     }
     true
+}
+
+/// True when `bytes` contain the path `dir` other than as the start of
+/// `within` (the target dir, which usually lies under a workspace root and
+/// has its own check) or of a longer file name (`/w/app` in `/w/app2`).
+pub(crate) fn names_path_outside(bytes: &[u8], dir: &str, within: &str) -> bool {
+    let d = dir.trim_end_matches('/').as_bytes();
+    if d.len() < 2 {
+        return false;
+    }
+    let mut i = 0;
+    while let Some(off) = bytes[i..].iter().position(|&b| b == d[0]) {
+        let at = i + off;
+        let rest = &bytes[at..];
+        if rest.starts_with(d)
+            && !rest.starts_with(within.as_bytes())
+            && !rest
+                .get(d.len())
+                .is_some_and(|c| c.is_ascii_alphanumeric() || b"._-+".contains(c))
+        {
+            return true;
+        }
+        i = at + 1;
+    }
+    false
 }
 
 /// Set a file's mtime to now: the LRU clock for eviction (`depcache_gc`).
@@ -1960,6 +2152,55 @@ pub(crate) fn reflink_or_copy(src: &Path, dst: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rustc_version_is_remembered_per_compiler_identity() {
+        let d = std::env::temp_dir().join(format!("jr-rustc-vv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (bin, lib, cache) = (d.join("tc/bin"), d.join("tc/lib"), d.join("cache"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        let rustc = bin.join("rustc");
+        let driver = lib.join("librustc_driver-abc.so");
+        std::fs::write(&rustc, b"\x7fELF not a real compiler").unwrap();
+        std::fs::write(&driver, b"one").unwrap();
+        let id = rustc_identity(&rustc).unwrap();
+        let memo = |id: &str| {
+            let mut h = H128::new();
+            h.field(b"rustc-vV-v1");
+            h.field(id.as_bytes());
+            cache.join("rustc-version").join(h.hex())
+        };
+        // Not runnable, nothing remembered: no answer, and nothing written.
+        assert_eq!(rustc_version_on_disk(&rustc, Some(&cache)), None);
+        assert!(!memo(&id).exists());
+        // Remembered: answered without running anything.
+        std::fs::create_dir_all(cache.join("rustc-version")).unwrap();
+        std::fs::write(memo(&id), "rustc 1.0.0\nhost: x\n").unwrap();
+        assert_eq!(
+            rustc_version_on_disk(&rustc, Some(&cache)).as_deref(),
+            Some("rustc 1.0.0\nhost: x\n")
+        );
+        // A torn or foreign file is not an answer.
+        std::fs::write(memo(&id), "rustc 1.0.0").unwrap();
+        assert_eq!(rustc_version_on_disk(&rustc, Some(&cache)), None);
+        std::fs::write(memo(&id), "rustc 1.0.0\nhost: x\n").unwrap();
+        // A replaced compiler library is a different compiler.
+        std::fs::write(&driver, b"two!").unwrap();
+        let id2 = rustc_identity(&rustc).unwrap();
+        assert_ne!(id, id2);
+        assert_eq!(rustc_version_on_disk(&rustc, Some(&cache)), None);
+        // So is a replaced launcher.
+        std::fs::write(&rustc, b"\x7fELF another compiler").unwrap();
+        assert_ne!(rustc_identity(&rustc).unwrap(), id2);
+        // A script and a rustup proxy are asked every time.
+        std::fs::write(&rustc, b"#!/bin/sh\nexec other\n").unwrap();
+        assert_eq!(rustc_identity(&rustc), None);
+        let rustup = bin.join("rustup");
+        std::fs::write(&rustup, b"\x7fELF proxy").unwrap();
+        assert_eq!(rustc_identity(&rustup), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn strict_hash_matches_content_and_length_across_buffer_sizes() {
@@ -2276,16 +2517,17 @@ mod tests {
         let mut env2 = env.clone();
         env2.extend([
             e("LIBRARY_PATH"),
-            // Cargo no longer sets this, but callers such as rustc bootstrap can.
+            // Neither cargo nor rustc read this; rustc bootstrap sets it only
+            // for file! determinism, so keying it splits ordinary builds.
             ("CARGO_RUSTC_CURRENT_DIR".into(), "/private/cwd".into()),
+            // A project's `[env]` pointing at its own checkout: not in a
+            // dependency's key, so it cannot have split it.
+            ("CARGO_WORKSPACE_DIR".into(), "/private/cwd/".into()),
             e("CARGO_PROFILE_DEV_DEBUG"),
             e("RUSTC_ICE"),
             e("LIBRARY_PATH"),
         ]);
-        assert_eq!(
-            user_keyed_env(&env2),
-            ["CARGO_RUSTC_CURRENT_DIR", "LIBRARY_PATH", "RUSTC_ICE"]
-        );
+        assert_eq!(user_keyed_env(&env2), ["LIBRARY_PATH", "RUSTC_ICE"]);
     }
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -2602,6 +2844,72 @@ mod tests {
         plan
     }
 
+    /// `[env]` variables a project points at its own checkout do not split
+    /// dependency keys between checkouts. Local units still key them.
+    #[test]
+    fn workspace_config_env_does_not_split_dependency_keys() {
+        let dir = std::env::temp_dir().join("jr-depcache-wsenv-plan");
+        let args: Vec<OsString> = s(&[
+            "--crate-name",
+            "x",
+            "src/lib.rs",
+            "--crate-type=lib",
+            "--emit=dep-info,metadata,link",
+            "-Cextra-filename=-abcd",
+            "--out-dir",
+            dir.join("target/debug/deps").to_str().unwrap(),
+        ])
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let plan = |e: &[(&str, &str)], local: bool| {
+            let key = local.then(|| LocalKey {
+                root: dir.join("localcache"),
+                salt: Vec::new(),
+                cwd: None,
+                portable: false,
+            });
+            plan_with(Path::new("rustc"), &args, &env(e), key).unwrap()
+        };
+        let none = plan(&[], false);
+        // Absolute on every platform: `/checkouts/a` has no drive on Windows.
+        let (checkout_a, checkout_b) = (dir.join("checkouts/a"), dir.join("checkouts/b"));
+        let (checkout_a, checkout_b) = (checkout_a.to_str().unwrap(), checkout_b.to_str().unwrap());
+        for name in ["CARGO_RUSTC_CURRENT_DIR", "CARGO_WORKSPACE_DIR"] {
+            assert!(workspace_config_env(name) && keyed_env(name) && !dep_keyed_env(name));
+            let a = plan(&[(name, checkout_a)], false);
+            let b = plan(&[(name, checkout_b)], false);
+            assert_eq!(a.base, b.base, "{name}");
+            assert_eq!(a.base, none.base, "{name}");
+            // The value is kept for the store-time output check.
+            assert_eq!(a.unkeyed_env, env(&[(name, checkout_a)]));
+            // Local units key it, and need no check.
+            let (la, lb) = (
+                plan(&[(name, checkout_a)], true),
+                plan(&[(name, checkout_b)], true),
+            );
+            assert_ne!(la.base, lb.base, "{name}");
+            assert!(la.unkeyed_env.is_empty());
+        }
+        assert!(none.unkeyed_env.is_empty());
+        // Other variables still split dependency keys.
+        assert_ne!(plan(&[("CARGO_PKG_NAME", "y")], false).base, none.base);
+        assert!(dep_keyed_env("CARGO_MANIFEST_DIR") && !dep_keyed_env("CARGO_BUILD_JOBS"));
+        // No check where the key already names the checkout (a vendored
+        // source's working dir is inside it), or for a relative value.
+        let cwd = std::env::current_dir().unwrap();
+        let inside = plan(&[("CARGO_WORKSPACE_DIR", cwd.to_str().unwrap())], false);
+        assert!(inside.unkeyed_env.is_empty());
+        let relative = plan(&[("CARGO_WORKSPACE_DIR", "")], false);
+        assert!(relative.unkeyed_env.is_empty());
+    }
+
     #[test]
     fn native_cpu_bypasses_dependency_and_local_plans() {
         // rustc supports both option-name spellings and all four flag forms.
@@ -2905,6 +3213,75 @@ mod tests {
         assert!(!target_refs_are_inputs(b"/t/debug/deps", "/t", &[]));
     }
 
+    /// A dependency output carrying an unkeyed workspace path it did not
+    /// declare reading is not stored. A declared read is, with its value.
+    #[test]
+    fn undeclared_unkeyed_workspace_path_is_not_stored() {
+        let dir = std::env::temp_dir().join(format!("jr-depcache-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = dir.join("app");
+        let deps = dir.join("app/target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(dir.join("src.rs"), "pub fn f() {}").unwrap();
+        let plan = |cache: &str| Plan {
+            base: "b".repeat(32),
+            out_dir: deps.clone(),
+            extra: "-abc".into(),
+            crate_name: "x".into(),
+            cwd: dir.clone(),
+            norm: Norm::new(deps.parent().unwrap()).unwrap(),
+            root: dir.join(cache),
+            extra_args: Vec::new(),
+            unkeyed_env: vec![("JR_TEST_WS_DIR".into(), ws.display().to_string())],
+        };
+        let write = |rmeta: String, declared: &str| {
+            std::fs::write(
+                deps.join("x-abc.d"),
+                format!(
+                    "{0}/x-abc.d: {1}\n\n{1}:\n{declared}",
+                    deps.display(),
+                    dir.join("src.rs").display()
+                ),
+            )
+            .unwrap();
+            std::fs::write(deps.join("libx-abc.rmeta"), rmeta).unwrap();
+        };
+        // Not named at all, or only as a longer sibling name.
+        write(format!("{0}2/x {0}-old/y", ws.display()), "");
+        assert!(plan("c1").store(0.0, 1.0, &[]).is_some());
+        // Named, undeclared.
+        write(format!("{}/fixtures", ws.display()), "");
+        assert!(plan("c2").store(0.0, 1.0, &[]).is_none());
+        write(ws.display().to_string(), "");
+        assert!(plan("c2").store(0.0, 1.0, &[]).is_none());
+        assert!(!dir.join("c2/m").exists());
+        // Named and declared (`env!`): the entry records the dependence.
+        write(
+            format!("{}/fixtures", ws.display()),
+            "# env-dep:JR_TEST_WS_DIR\n",
+        );
+        let line = plan("c3").store(0.0, 1.0, &[]).unwrap();
+        let e: Entry = serde_json::from_str(&line).unwrap();
+        assert_eq!(e.env, [("JR_TEST_WS_DIR".to_owned(), None)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_path_outside_ignores_the_target_dir_and_longer_names() {
+        let t = "/w/app/target";
+        assert!(names_path_outside(b"x /w/app/src/a.rs", "/w/app", t));
+        assert!(names_path_outside(b"/w/app\0", "/w/app/", t));
+        assert!(names_path_outside(b"/w/app", "/w/app", t));
+        assert!(!names_path_outside(b"/w/app/target/debug", "/w/app", t));
+        assert!(!names_path_outside(
+            b"/w/app2/src /w/app-old /w/ap",
+            "/w/app",
+            t
+        ));
+        assert!(!names_path_outside(b"anything /", "/", t));
+        assert!(names_path_outside(b"/w/app/target/x /w/app/y", "/w/app", t));
+    }
+
     /// Store a fake compile from one target dir, restore into another, and
     /// check that a changed source, a corrupt manifest, or missing cached
     /// files all miss instead of restoring something wrong.
@@ -2927,6 +3304,7 @@ mod tests {
                 norm: Norm::new(out_dir.parent().unwrap()).unwrap(),
                 root: dir.join("cache"),
                 extra_args: Vec::new(),
+                unkeyed_env: Vec::new(),
             }
         };
         let p1 = mk("t1");
@@ -3028,6 +3406,44 @@ mod tests {
         p3.root = blocker.join("root");
         assert!(p3.store(0.0, 1.0, &[]).is_none());
         assert!(p3.restore(&mut Vec::new()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_only_ignores_native_archive_bytes() {
+        let dir = std::env::temp_dir().join(format!("jr-meta-native-{}", std::process::id()));
+        let target = dir.join("target");
+        let native_dir = target.join("debug/build/ring-1234567890abcdef/out");
+        std::fs::create_dir_all(&native_dir).unwrap();
+        let archive = native_dir.join("libring_core.a");
+        let norm = Norm::new(&target.join("debug")).unwrap();
+        let key_for = |emit: &str| {
+            let args = vec![
+                format!("--emit={emit}"),
+                "-L".into(),
+                format!("native={}", native_dir.display()),
+            ];
+            let mut h = H128::new();
+            key_args_with(&args, &norm, &dir, &mut h, &|_| Some("x".into())).unwrap();
+            h.hex()
+        };
+
+        std::fs::write(&archive, b"archive-bytes-from-fleet").unwrap();
+        let meta_a = key_for("dep-info,metadata");
+        let link_a = key_for("dep-info,metadata,link");
+
+        std::fs::write(&archive, b"archive-bytes-from-host-cc").unwrap();
+        let meta_b = key_for("dep-info,metadata");
+        let link_b = key_for("dep-info,metadata,link");
+
+        assert_eq!(
+            meta_a, meta_b,
+            "metadata-only key must ignore native .a bytes"
+        );
+        assert_ne!(
+            link_a, link_b,
+            "linked rlib key must include native .a bytes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

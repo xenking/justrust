@@ -14,6 +14,15 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 RELEVANT = ["toolchain", "scripts/toolchain-candidate.py", "scripts/toolchain-source.py",
             "Cargo.toml", "Cargo.lock", "build.rs", ".cargo"]
+# What the compiler and Cargo are built from. A client release bumps the root
+# Cargo.toml and Cargo.lock, which the frozen snapshot of the revision never
+# reads. The ship tool resumes a tag behind such commits, so this must agree
+# with its TOOLCHAIN_SOURCE or a resumed ship can never build (2026-11-27).
+TOOLCHAIN_SOURCE = ["toolchain", "scripts/toolchain-candidate.py", "scripts/toolchain-source.py"]
+
+
+def cargo_archive_argv(root, revision):
+    return ["git", "-C", str(root), "archive", revision, "--", "toolchain", ":(exclude)toolchain/rustc"]
 
 
 def git(root, *args):
@@ -27,11 +36,12 @@ def validate_source(root, revision):
         raise ValueError("candidate builds require the stable branch")
     head = git(root, "rev-parse", "HEAD")
     if head != revision:
-        # HEAD may advance during a long build through unrelated commits
-        # (other agents share stable). Only relevant source drift fails.
+        # HEAD may advance through unrelated commits, client releases
+        # included (other agents share stable). Only toolchain source drift
+        # fails.
         if subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", revision, head]).returncode != 0:
             raise ValueError("--source-commit must be the checked-out HEAD or an ancestor of it")
-        if git(root, "diff", "--name-only", revision, head, "--", *RELEVANT):
+        if git(root, "diff", "--name-only", revision, head, "--", *TOOLCHAIN_SOURCE):
             raise ValueError("relevant toolchain source changed between --source-commit and HEAD")
     dirty = git(root, "status", "--porcelain", "--untracked-files=no", "--", *RELEVANT)
     if dirty:
@@ -72,7 +82,13 @@ def make_plan(root, revision, output, optimize="none"):
     candidate = "jr-" + revision
     directory = Path(output).resolve() / candidate
     snapshot = directory / "source"
-    target = snapshot / "toolchain/cargo/target"
+    # jr-cargo builds wherever justrust routes builds (hosted when local
+    # compiles are off) and the binary is fetched back. The hosted mirror root
+    # is the nearest `.git` ancestor, and jr-cargo reads toolchain/shared and
+    # toolchain/resident-inputs outside its own workspace, so it gets a small
+    # frozen tree with a git root: everything under toolchain/ but the compiler.
+    cargo_root = directory / "cargo-source"
+    target = cargo_root / "toolchain/cargo/target"
     return {
         "schema_version": 1,
         "candidate_id": candidate,
@@ -83,27 +99,46 @@ def make_plan(root, revision, output, optimize="none"):
         "state": "planned",
         "provenance_directory": str(directory),
         "build_root": str(snapshot),
+        "cargo_build_root": str(cargo_root),
         "source_metadata": git(root, "show", "-s", "--format=%H%n%h%n%cs", "--abbrev=9", revision),
         "compiler_identity": "Archive metadata identifies integrated repository source; verify actual rustc -vV before packaging",
         "optimize": optimize,
         "commands": compiler_commands(snapshot, optimize) + [
             {"argv": ["bash", "toolchain/cargo/build-jr.sh", "nightly-2026-10-08"],
-             "cwd": str(snapshot), "env": {"JUSTRUST_REMOTE": "off", "CARGO_TARGET_DIR": str(target),
-                                       "JR_CARGO_FEATURES": "all-static",
-                                       "JUSTRUST_LOCAL_REASON": "release packaging needs the installable local jr-cargo binary"}},
+             "cwd": str(cargo_root), "env": {"CARGO_TARGET_DIR": str(target),
+                                         "JR_CARGO_FEATURES": "all-static"},
+             # The helper exits 0 when a remote build brings no binary back.
+             "produces": str(target / "release/cargo")},
         ],
         "artifacts": {"compiler_sysroot": str(snapshot / "toolchain/rustc/build/jr" / ("pgo-bolt" if optimize == "pgo-bolt" else "release")),
                       "jr_cargo": str(target / "release/cargo")},
     }
 
 
+CARGO_BUILD_ATTEMPTS = 3
+
+
 def build_stages(commands, run):
-    """Overlap the pinned Cargo build with bootstrap, never with PGO training."""
+    """Overlap the pinned Cargo build with bootstrap, never with PGO training.
+
+    The Cargo build runs wherever justrust routes builds, so a network drop can
+    fail it while bootstrap is fine (2026-11-27: one rsync error cost a
+    17 minute compiler stage). It is idempotent, so a failed one is repeated
+    after bootstrap, still before training starts.
+    """
     compiler, cargo = commands[:-1], commands[-1]
     with ThreadPoolExecutor(max_workers=1) as pool:
         cargo_result = pool.submit(run, cargo)
         run(compiler[0])
-        cargo_result.result()
+        for attempt in range(1, CARGO_BUILD_ATTEMPTS + 1):
+            try:
+                cargo_result.result() if attempt == 1 else run(cargo)
+                break
+            except (subprocess.CalledProcessError, OSError) as error:
+                if attempt == CARGO_BUILD_ATTEMPTS:
+                    raise
+                print(f"toolchain-candidate: Cargo build failed (attempt {attempt} of "
+                      f"{CARGO_BUILD_ATTEMPTS}), repeating it: {error}", file=sys.stderr, flush=True)
     for command in compiler[1:]:
         run(command)
 
@@ -128,6 +163,16 @@ def execute(plan):
         with tarfile.open(archive) as source:
             source.extractall(snapshot, filter="data")
         archive.unlink()
+        cargo_root = Path(plan["cargo_build_root"])
+        cargo_root.mkdir()
+        cargo_archive = directory / "cargo-source.tar"
+        with cargo_archive.open("wb") as output:
+            subprocess.run(cargo_archive_argv(root, plan["source_revision"]),
+                           stdout=output, check=True, stdin=subprocess.DEVNULL)
+        with tarfile.open(cargo_archive) as source:
+            source.extractall(cargo_root, filter="data")
+        cargo_archive.unlink()
+        subprocess.run(["git", "init", "-q", str(cargo_root)], check=True, stdin=subprocess.DEVNULL)
         # Only the private snapshot changes. Never rewrite live tracked metadata.
         (snapshot / "toolchain/rustc/git-commit-info").write_text(plan["source_metadata"] + "\n")
         # Tells bootstrap to report that revision instead of a source content hash.
@@ -137,6 +182,9 @@ def execute(plan):
             env = dict(os.environ, **command["env"], CI="1", GIT_TERMINAL_PROMPT="0")
             subprocess.run(command["argv"], cwd=command["cwd"], env=env,
                            stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr, check=True)
+            produced = command.get("produces")
+            if produced and not os.access(produced, os.X_OK):
+                raise ValueError(f"build helper did not produce executable artifact: {produced}")
         build_stages(plan["commands"], run)
         validate_snapshot_source(root, plan["source_revision"])
         for artifact in (Path(plan["artifacts"]["compiler_sysroot"]) / "bin/rustc",

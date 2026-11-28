@@ -149,7 +149,7 @@ fn changing_profiles_caches_targets() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
 [DOCTEST] foo
 
 "#]])
@@ -167,7 +167,7 @@ fn changing_profiles_caches_targets() {
     p.cargo("test foo")
         .with_stderr_data(str![[r#"
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
 
 "#]])
         .run();
@@ -505,8 +505,8 @@ fn no_rebuild_transitive_target_deps() {
 [COMPILING] b v0.0.1 ([ROOT]/foo/b)
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
-[EXECUTABLE] tests/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[EXECUTABLE] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
+[EXECUTABLE] tests/foo.rs (target/debug/deps/foo-[HASH][EXE])
 
 "#]])
         .run();
@@ -991,7 +991,7 @@ fn reuse_workspace_lib() {
 [COMPILING] baz v0.1.1 ([ROOT]/foo/baz)
 [RUNNING] `rustc --crate-name baz [..]
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] `[ROOT]/foo/target/debug/build/baz/[HASH]/out/baz-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/deps/baz-[HASH][EXE]`
 
 "#]])
         .run();
@@ -1061,11 +1061,12 @@ fn changing_rustflags_is_cached() {
 
 "#]])
         .run();
+    // A linker flag cannot change what an rlib contains, so it is neither in
+    // the unit hash nor in the fingerprint: nothing is rebuilt.
     p.cargo("build -v")
         .env("RUSTFLAGS", "-C linker=cc")
         .with_stderr_data(str![[r#"
-[COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc [..]
+[FRESH] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1166,7 +1167,7 @@ fn reuse_panic_build_dep_test() {
 [RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/build_script_build`
 [RUNNING] `rustc --crate-name foo [..] src/lib.rs [..]--test[..]
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/foo-[HASH][EXE]`
+[EXECUTABLE] `[ROOT]/foo/target/debug/deps/foo-[HASH][EXE]`
 
 "#]])
         .run();
@@ -1696,7 +1697,10 @@ fn linking_interrupted() {
                         args.next().unwrap()
                     }
                 };
-                std::fs::remove_file(&output).unwrap();
+                // justrust: with the build-dir layout the test binary is
+                // uplifted, so cargo deletes the previous output before
+                // rustc runs (rust-lang/cargo#8348). It may be absent.
+                drop(std::fs::remove_file(&output));
                 std::fs::write(&output, "").unwrap();
                 // Tell the test that we are ready to be interrupted.
                 let mut socket = std::net::TcpStream::connect("__ADDR__").unwrap();
@@ -1779,7 +1783,7 @@ fn linking_interrupted() {
 [RUNNING] `rustc --crate-name foo [..]
 [RUNNING] `rustc --crate-name t1 [..]
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/t1-[HASH][EXE]`
+[RUNNING] `[ROOT]/foo/target/debug/deps/t1-[HASH][EXE]`
 
 "#]])
         .run();
@@ -2041,5 +2045,43 @@ fn changing_linker() {
 [ERROR] linker `nonexistent-linker` not found
 ...
 "#]])
+        .run();
+}
+
+/// A build that fails empties the unit's fingerprint hash and has already
+/// removed its old output. The next build names that, instead of "couldn't
+/// read metadata for file", which reads as if a finished output was deleted.
+#[cargo_test]
+fn rebuild_after_a_failed_build_names_the_unfinished_build() {
+    let p = project().file("src/main.rs", "fn main() {}").build();
+    p.cargo("build").run();
+    p.change_file("src/main.rs", "fn main() { nope }");
+    p.cargo("build")
+        .with_status(101)
+        .with_stderr_contains(
+            "[ERROR] could not compile `foo` (bin \"foo\") due to 1 previous error",
+        )
+        .run();
+    p.change_file("src/main.rs", "fn main() { }");
+    p.cargo("build -v")
+        .with_stderr_data(str![[r#"
+[DIRTY] foo v0.0.1 ([ROOT]/foo): the last build of this target failed or was stopped before it finished, so `target/debug/[..]foo[..]` does not exist
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    // An output removed after a finished build keeps the old wording.
+    let mut removed = 0;
+    for exe in p.glob("target/debug/build/**/out/foo") {
+        std::fs::remove_file(exe.unwrap()).unwrap();
+        removed += 1;
+    }
+    assert!(removed > 0);
+    p.cargo("build -v")
+        .with_stderr_contains(
+            "[DIRTY] foo v0.0.1 ([ROOT]/foo): couldn't read metadata for file `[..]`",
+        )
         .run();
 }

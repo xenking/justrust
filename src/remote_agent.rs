@@ -712,9 +712,11 @@ pub fn serve<R: Read>(mut input: R, out: Box<dyn Write + Send>, prefix: String) 
 /// Workspaces cap `build.jobs` for their contributors' laptops (Jcode sets
 /// `jobs = 4` for ~15 GB machines), which left 28 of the build machine's 32
 /// cores idle. This machine runs only justrust builds, so size jobs for it:
-/// every core, bounded by memory at ~2 GiB per job. Job count is not part
-/// of any fingerprint. An explicit `-j`/`--jobs` or a client-sent
-/// `CARGO_BUILD_JOBS` wins.
+/// by cores up to `GOVERNED_JOBS`, with memory admitted per compiler by the
+/// governor (`src/memgov.rs`) instead of a static ~2 GiB per job, which
+/// gave 14 jobs on a 96-core, 29-GiB slot. Without the governor the static
+/// bound stays. Job count is not part of any fingerprint. An explicit
+/// `-j`/`--jobs` or a client-sent `CARGO_BUILD_JOBS` wins.
 fn machine_jobs(args: &[String], env: &[(String, String)]) -> Option<usize> {
     if env.iter().any(|(k, _)| k == "CARGO_BUILD_JOBS")
         || args
@@ -725,8 +727,29 @@ fn machine_jobs(args: &[String], env: &[(String, String)]) -> Option<usize> {
         return None;
     }
     let cpus = std::thread::available_parallelism().ok()?.get();
+    if memory_governed(env) {
+        return Some(cpus.clamp(1, GOVERNED_JOBS));
+    }
     let mem_gib = crate::procfs::installed_mb().map(|mb| (mb >> 10) as usize);
     Some(jobs_for(cpus, mem_gib))
+}
+
+/// Where more jobs stopped paying on the 96-core slot: cold `check` of a
+/// 613-unit workspace took 26.0 s at 14 jobs, 21.1 at 24, 20.7 at 32, 19.4
+/// at 48 and 19.5 at 64 (runs 20261126-164410278-472317 to
+/// 20261126-164548863-485986). The dependency graph, not the core count,
+/// is the limit: about 10 cores were busy on average at every setting.
+const GOVERNED_JOBS: usize = 48;
+
+/// The memory governor runs for this machine's builds unless the client or
+/// this agent's own environment turns it off (`JUSTRUST_MEMGOV=0`).
+fn memory_governed(env: &[(String, String)]) -> bool {
+    let set = env
+        .iter()
+        .find(|(k, _)| k == crate::memgov::ENV)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(crate::memgov::ENV).ok());
+    cfg!(target_os = "linux") && set.is_none_or(|v| crate::memgov::on(&v))
 }
 
 /// The toolchain a build on this machine uses when the project pins none:
@@ -924,85 +947,6 @@ fn mirror_cargo_home(client: &Path) -> Option<PathBuf> {
     ready(client).then(|| client.to_path_buf())
 }
 
-/// Translate the explicit experiment only inside the already admitted guest run.
-/// Paths belong to the unprivileged tenant guest, not the calling machine.
-pub(crate) fn hosted_hybrid_env(
-    args: &[String],
-    env: &[(String, String)],
-) -> Result<Vec<(&'static str, String)>> {
-    let value = |name: &str| -> Result<Option<&str>> {
-        let mut matches = env.iter().filter(|(key, _)| key == name);
-        let first = matches.next().map(|(_, value)| value.as_str());
-        if matches.next().is_some() {
-            bail!("duplicate hosted hybrid control: {name}");
-        }
-        Ok(first)
-    };
-    let controls = [
-        "JUSTRUST_HOSTED_HYBRID",
-        "JUSTRUST_HOSTED_HYBRID_ENGINE",
-        "JUSTRUST_HOSTED_HYBRID_TOOLCHAIN",
-        "JUSTRUST_HOSTED_HYBRID_HOME",
-        "JUSTRUST_HOSTED_HYBRID_PREWARM",
-    ];
-    if !env.iter().any(|(key, _)| controls.contains(&key.as_str())) {
-        return Ok(Vec::new());
-    }
-    if value(controls[0])? != Some("ready") {
-        bail!("hosted hybrid requires JUSTRUST_HOSTED_HYBRID=ready");
-    }
-    if !matches!(
-        args.first().map(String::as_str),
-        Some("build" | "test" | "check" | "run")
-    ) {
-        bail!("hosted hybrid supports only build, test, check, and run");
-    }
-    if value(controls[4])?.is_some() {
-        bail!("hosted hybrid background prewarm is not supported");
-    }
-    let mut mapped = vec![("JUSTRUST_HYBRID", "ready".to_owned())];
-    for (source, target) in [
-        (controls[1], "JUSTRUST_NATIVE_ENGINE"),
-        (controls[2], "JUSTRUST_HYBRID_TOOLCHAIN"),
-        (controls[3], "JR_ENGINE_HOME"),
-    ] {
-        let path = value(source)?.with_context(|| format!("hosted hybrid requires {source}"))?;
-        let parsed = Path::new(path);
-        if !parsed.is_absolute()
-            || parsed.parent().is_none()
-            || parsed.components().any(|part| {
-                matches!(
-                    part,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
-            || path.contains('\0')
-        {
-            bail!("{source} must be an absolute guest path without traversal");
-        }
-        mapped.push((target, path.to_owned()));
-    }
-    // Private native artifacts do not yet implement the ordinary hosted fetch
-    // contract. Preserve Cargo for artifact-producing/fetch-only requests.
-    let command = args.first().map(String::as_str);
-    let artifact_request = args
-        .iter()
-        .skip(1)
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| {
-            matches!(
-                arg.as_str(),
-                "--no-run" | "--doc" | "--fetch" | "--artifact-dir" | "--out-dir"
-            ) || arg.starts_with("--fetch=")
-                || arg.starts_with("--artifact-dir=")
-                || arg.starts_with("--out-dir=")
-        });
-    if !matches!(command, Some("check" | "test")) || artifact_request {
-        return Ok(Vec::new());
-    }
-    Ok(mapped)
-}
-
 #[cfg(unix)]
 fn valid_canonical_repo(repo: &str) -> bool {
     !repo.is_empty()
@@ -1120,17 +1064,22 @@ fn bwrap_canonical_mount(cwd: &Path, env: &[(String, String)]) -> Option<PathBuf
     Some(canonical)
 }
 
-fn prebuilt_proxy_url() -> Option<&'static str> {
-    static URL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+/// The loopback proxy's URL and the store it serves.
+fn prebuilt_proxy() -> Option<&'static (String, String)> {
+    static URL: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
     URL.get_or_init(|| {
         let upstream = crate::depcache_prebuilt::base()?;
         if !upstream.starts_with("https://") && !upstream.starts_with("http://") {
             return None;
         }
         let cache_dir = crate::paths::cache_root()?.join("prebuilt-mirror");
-        crate::prebuilt_proxy::start(upstream, cache_dir)
+        let url = crate::prebuilt_proxy::start_with(
+            crate::depcache_prebuilt::proxy_sources(&upstream),
+            cache_dir,
+        )?;
+        Some((url, upstream))
     })
-    .as_deref()
+    .as_ref()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1144,10 +1093,6 @@ fn start_run(
     out: &Out,
     pids: &Arc<Mutex<HashMap<u64, RunStatus>>>,
 ) -> Result<i32> {
-    let hybrid = hosted_hybrid_env(args, env)?;
-    if hybrid.is_empty() && env.iter().any(|(key, _)| key == "JUSTRUST_HOSTED_HYBRID") {
-        send(out, &Msg::Out { id, stream: 2 }, b"justrust remote: hosted hybrid Cargo fallback (native artifact delivery unsupported for this request)\n");
-    }
     #[cfg(target_os = "linux")]
     let canonical_mount = bwrap_canonical_mount(cwd, env);
     #[cfg(not(target_os = "linux"))]
@@ -1208,26 +1153,6 @@ fn start_run(
         .stderr(Stdio::piped())
         .detached();
     own_run_lifetime(&mut c);
-    // Never allow inherited experiment state or detached prewarm to leak into
-    // ordinary guest runs. Fallback re-execs keep ON_AGENT and remove HYBRID,
-    // so they cannot recurse through this one-time agent-side translation.
-    for name in [
-        "JUSTRUST_HOSTED_HYBRID",
-        "JUSTRUST_HOSTED_HYBRID_ENGINE",
-        "JUSTRUST_HOSTED_HYBRID_TOOLCHAIN",
-        "JUSTRUST_HOSTED_HYBRID_HOME",
-        "JUSTRUST_HOSTED_HYBRID_PREWARM",
-        "JUSTRUST_HYBRID",
-        "JUSTRUST_HYBRID_PREWARM",
-        "JUSTRUST_HYBRID_FALLBACK",
-        "JUSTRUST_NATIVE_ENGINE",
-        "JUSTRUST_HYBRID_TOOLCHAIN",
-        "JR_ENGINE_HOME",
-        "JR_HYBRID_DECISION_FD",
-    ] {
-        c.env_remove(name);
-    }
-    c.envs(hybrid);
     if let Some((_, value)) = env
         .iter()
         .find(|(k, _)| k == crate::remote_proto::CLIENT_UMASK)
@@ -1256,6 +1181,9 @@ fn start_run(
     let policy = crate::toolchain_policy::current();
     match store_toolchain(cwd, args, env, policy.as_ref()) {
         Ok(Some(tc)) => {
+            // A compiler this machine has not built with before: its copy
+            // of the store's index predates the fleet's units for it.
+            crate::prebuilt_proxy::note_toolchain(tc.as_ref());
             c.env("JUSTRUST_TOOLCHAIN", tc);
         }
         Ok(None) => {}
@@ -1263,6 +1191,11 @@ fn start_run(
     }
     if let Some(j) = machine_jobs(args, env) {
         c.env("CARGO_BUILD_JOBS", j.to_string());
+    }
+    // Always on here, also under an explicit job count: that is when a
+    // build can ask for more memory than the machine has.
+    if memory_governed(env) {
+        c.env(crate::memgov::ENV, "1");
     }
     // Fetch every store hit here. The per-fetch overhead the cost model
     // assumes (700 ms, a laptop under agent load) declined 487 of 529
@@ -1276,9 +1209,12 @@ fn start_run(
     // loopback proxy (pooled upstream TLS + local NVMe cache) when the caller
     // has not overridden JUSTRUST_PREBUILT.
     if !env.iter().any(|(k, _)| k == "JUSTRUST_PREBUILT")
-        && let Some(proxy_url) = prebuilt_proxy_url()
+        && let Some((proxy_url, store)) = prebuilt_proxy()
     {
         c.env("JUSTRUST_PREBUILT", proxy_url);
+        // The proxy's port differs per agent. Shims name their copy of the
+        // store's index after the store, so sessions share one.
+        c.env(crate::depcache_prebuilt::STORE_ENV, store);
     }
     // Enable workspace-portable localcache on hosted builds so unchanged
     // workspace crates reuse across git worktrees and fresh checkouts of the
@@ -1526,8 +1462,6 @@ fn own_run_lifetime(command: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::hosted_hybrid_env;
-
     #[test]
     fn hosted_early_defaults_respect_client_and_kill_switch() {
         use super::hosted_early_env;
@@ -1547,101 +1481,6 @@ mod tests {
         );
     }
 
-    fn hybrid_config() -> Vec<(String, String)> {
-        [
-            ("JUSTRUST_HOSTED_HYBRID", "ready"),
-            ("JUSTRUST_HOSTED_HYBRID_ENGINE", "/guest/bin/jr-native"),
-            ("JUSTRUST_HOSTED_HYBRID_TOOLCHAIN", "/guest/toolchain"),
-            ("JUSTRUST_HOSTED_HYBRID_HOME", "/guest/private/hybrid"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.into(), v.into()))
-        .collect()
-    }
-
-    #[test]
-    fn hosted_hybrid_maps_only_explicit_guest_configuration() {
-        let args = vec!["test".into(), "--".into(), "name with spaces".into()];
-        let original = args.clone();
-        assert_eq!(
-            hosted_hybrid_env(&args, &hybrid_config()).unwrap(),
-            vec![
-                ("JUSTRUST_HYBRID", "ready".into()),
-                ("JUSTRUST_NATIVE_ENGINE", "/guest/bin/jr-native".into()),
-                ("JUSTRUST_HYBRID_TOOLCHAIN", "/guest/toolchain".into()),
-                ("JR_ENGINE_HOME", "/guest/private/hybrid".into()),
-            ]
-        );
-        assert_eq!(args, original);
-        assert!(hosted_hybrid_env(&args, &[]).unwrap().is_empty());
-        assert!(
-            hosted_hybrid_env(
-                &args,
-                &[("JUSTRUST_NATIVE_ENGINE".into(), "/local/engine".into())]
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn hosted_hybrid_preserves_cargo_artifact_delivery() {
-        for args in [
-            vec!["build"],
-            vec!["run"],
-            vec!["test", "--no-run"],
-            vec!["test", "--doc"],
-            vec!["test", "--fetch"],
-            vec!["check", "--fetch=all"],
-            vec!["test", "--artifact-dir", "/out"],
-        ] {
-            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-            assert!(
-                hosted_hybrid_env(&args, &hybrid_config())
-                    .unwrap()
-                    .is_empty()
-            );
-            let mut invalid = hybrid_config();
-            invalid.pop();
-            assert!(hosted_hybrid_env(&args, &invalid).is_err());
-        }
-        assert!(
-            !hosted_hybrid_env(
-                &["test".into(), "--".into(), "--no-run".into()],
-                &hybrid_config()
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn hosted_hybrid_rejects_partial_invalid_and_detached_requests() {
-        for command in ["hybrid", "native", "setup", "clean", "prewarm", ""] {
-            assert!(hosted_hybrid_env(&[command.into()], &hybrid_config()).is_err());
-        }
-        for index in 0..4 {
-            let mut config = hybrid_config();
-            config.remove(index);
-            assert!(hosted_hybrid_env(&["check".into()], &config).is_err());
-        }
-        for path in ["relative", "/", "/guest/../escape", "", "/guest/\0bad"] {
-            let mut config = hybrid_config();
-            config[1].1 = path.into();
-            assert!(hosted_hybrid_env(&["check".into()], &config).is_err());
-        }
-        for extra in [
-            ("JUSTRUST_HOSTED_HYBRID_PREWARM", "after-success"),
-            ("JUSTRUST_HOSTED_HYBRID", "ready"),
-        ] {
-            let mut config = hybrid_config();
-            config.push((extra.0.into(), extra.1.into()));
-            assert!(hosted_hybrid_env(&["check".into()], &config).is_err());
-        }
-        let mut config = hybrid_config();
-        config[0].1 = "on".into();
-        assert!(hosted_hybrid_env(&["check".into()], &config).is_err());
-    }
     #[test]
     fn max_run_defaults_and_overrides() {
         assert_eq!(super::parse_max_run(None), super::DEFAULT_MAX_RUN);
@@ -1749,16 +1588,21 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("jr-owner-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
+        let nested = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "remote_agent::tests::detached_run_dies_with_its_agent",
                 "--nocapture",
             ])
             .env(FLAG, &dir)
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(
+            nested.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&nested.stdout),
+            String::from_utf8_lossy(&nested.stderr)
+        );
         for _ in 0..250 {
             if dir.join("stopped").exists() {
                 break;
@@ -1960,5 +1804,20 @@ mod tests {
         assert!(machine_jobs(&s(&["test"]), &env).is_none());
         // Test-binary args after `--` are not cargo's.
         assert!(machine_jobs(&s(&["test", "--", "-j"]), &[]).is_some());
+    }
+
+    #[test]
+    fn governed_jobs_follow_cores_not_memory() {
+        let kv = |v: &str| [(crate::memgov::ENV.to_string(), v.to_string())];
+        let args = ["check".to_string()];
+        let cpus = std::thread::available_parallelism().unwrap().get();
+        if cfg!(target_os = "linux") {
+            assert!(memory_governed(&kv("1")));
+            assert_eq!(machine_jobs(&args, &kv("1")), Some(cpus.min(GOVERNED_JOBS)));
+        }
+        // Turned off, the static memory bound is back.
+        assert!(!memory_governed(&kv("0")));
+        let mem_gib = crate::procfs::installed_mb().map(|mb| (mb >> 10) as usize);
+        assert_eq!(machine_jobs(&args, &kv("0")), Some(jobs_for(cpus, mem_gib)));
     }
 }

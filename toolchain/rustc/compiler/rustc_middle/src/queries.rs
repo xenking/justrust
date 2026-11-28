@@ -87,7 +87,7 @@ use crate::middle::debugger_visualizer::DebuggerVisualizerFile;
 use crate::middle::deduced_param_attrs::DeducedParamAttrs;
 use crate::middle::exported_symbols::{ExportedSymbol, SymbolExportInfo};
 use crate::middle::lib_features::LibFeatures;
-use crate::middle::privacy::EffectiveVisibilities;
+use crate::middle::privacy::{EffectiveVisibilities, EffectiveVisibility};
 use crate::middle::resolve::{
     AstOwner, DocLinkResMap, ModChild, ResolverAstLowering, ResolverGlobalCtxt,
 };
@@ -608,6 +608,17 @@ rustc_queries! {
         // untracked `-Zunstable-options` flag is set.
         eval_always
         desc { "Computing all lints that are explicitly enabled or with a default level greater than Allow" }
+    }
+
+    /// Returns the crate imported by the given `extern crate` item.
+    ///
+    /// A query, not a direct read of `resolutions(())`, so that a reader is
+    /// invalidated only when this item's crate changes. Derive expansions
+    /// put an `extern crate` in most modules, and the per-module stability
+    /// check reads it: reading the whole resolver output there re-ran the
+    /// check for every such module after any edit that changed resolution.
+    query extern_mod_stmt_cnum(def_id: LocalDefId) -> Option<CrateNum> {
+        desc { "looking up the crate imported by `{}`", tcx.def_path_str(def_id) }
     }
 
     query expn_that_defined(key: DefId) -> rustc_span::ExpnId {
@@ -1239,6 +1250,13 @@ rustc_queries! {
         separate_provide_extern
     }
 
+    /// Effective visibility of one local definition, projected out of
+    /// `effective_visibilities(())`. Per-module lints read this instead of the whole
+    /// table, so `lint_mod` stays green when an edit adds or removes unrelated items.
+    query local_effective_visibility(def_id: LocalDefId) -> Option<EffectiveVisibility> {
+        desc { "getting the effective visibility of `{}`", tcx.def_path_str(def_id) }
+    }
+
     /// Performs lint checking for the module.
     query lint_mod(key: LocalModId) {
         desc { "linting {}", describe_as_module(key, tcx) }
@@ -1697,14 +1715,52 @@ rustc_queries! {
     }
 
     /// Given a trait `trait_id`, return all known `impl` blocks.
+    ///
+    /// Changes whenever any impl of the trait is added or removed. Trait
+    /// selection must not read it: see `trait_impls_excluding_direct`.
     query trait_impls_of(trait_id: DefId) -> &'tcx ty::trait_def::TraitImpls {
         arena_cache
         desc { "finding trait impls of `{}`", tcx.def_path_str(trait_id) }
     }
 
+    /// The impls of `trait_id` without the local impls whose self type names
+    /// an ADT directly (those are found through `local_direct_impls_of_adt`).
+    ///
+    /// Adding `#[derive(Debug)]` to one local type therefore leaves this
+    /// value for `Debug` unchanged, and candidate assembly for every other
+    /// type stays green. Reading `trait_impls_of` there re-ran type checking
+    /// of most of the crate after any edit that added an impl.
+    query trait_impls_excluding_direct(trait_id: DefId) -> &'tcx ty::trait_def::TraitImpls {
+        arena_cache
+        desc { "finding trait impls of `{}` that are not direct local ADT impls", tcx.def_path_str(trait_id) }
+    }
+
+    /// For each ADT, the local trait impls whose self type is a path that
+    /// resolves to that ADT, as `(trait, impl)`.
+    query local_direct_adt_impls(_: ()) -> &'tcx rustc_data_structures::fx::FxIndexMap<DefId, Vec<(DefId, DefId)>> {
+        arena_cache
+        desc { "indexing local trait impls by self ADT" }
+    }
+
+    /// The local trait impls whose self type is a path that resolves to the
+    /// ADT `adt`, as `(trait, impl)`. See `trait_impls_excluding_direct`.
+    query local_direct_impls_of_adt(adt: DefId) -> &'tcx [(DefId, DefId)] {
+        desc { "finding local trait impls for `{}`", tcx.def_path_str(adt) }
+    }
+
     query specialization_graph_of(trait_id: DefId) -> Result<&'tcx specialization_graph::Graph, ErrorGuaranteed> {
         desc { "building specialization graph of trait `{}`", tcx.def_path_str(trait_id) }
         cache_on_disk
+    }
+    /// The specialization parent of a trait impl: the impl it specializes, or
+    /// the trait itself for a root impl. `Err` if building the trait's
+    /// specialization graph reported an error.
+    ///
+    /// Callers that walk ancestors read this instead of
+    /// `specialization_graph_of`, whose value changes whenever any impl of
+    /// the trait is added or removed.
+    query specialization_parent(impl_def_id: DefId) -> Result<DefId, ErrorGuaranteed> {
+        desc { "finding the specialization parent of `{}`", tcx.def_path_str(impl_def_id) }
     }
     query dyn_compatibility_violations(trait_id: DefId) -> &'tcx [DynCompatibilityViolation] {
         desc { "determining dyn-compatibility of trait `{}`", tcx.def_path_str(trait_id) }
@@ -2432,6 +2488,16 @@ rustc_queries! {
         eval_always
         desc { "looking at the source for a crate" }
         separate_provide_extern
+    }
+
+    /// Whether the crate was loaded from an rlib or rmeta file.
+    ///
+    /// A projection of `used_crate_source` without the file paths. Code
+    /// generation asks this for every codegen unit of a leaf crate (for the
+    /// gdb scripts section), and the paths change whenever the same build
+    /// runs in another target directory, which made every unit re-run.
+    query crate_source_is_rlib_or_rmeta(cnum: CrateNum) -> bool {
+        desc { "checking whether a crate was loaded from an rlib or rmeta" }
     }
 
     /// Returns the debugger visualizers defined for this crate.

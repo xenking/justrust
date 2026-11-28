@@ -128,7 +128,7 @@ fn cargo_compile_incremental() {
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
 [RUNNING] `rustc [..] -C incremental=[ROOT]/foo/target/debug/incremental[..]`
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] `[ROOT]/foo/target/debug/build/foo/[HASH]/out/foo-[HASH][EXE]`
+[RUNNING] `[ROOT]/foo/target/debug/deps/foo-[HASH][EXE]`
 
 "#]])
         .run();
@@ -1710,10 +1710,8 @@ fn crate_env_vars() {
                     let tmpdir: PathBuf = tmp.unwrap().into();
 
                     let exe: PathBuf = env::current_exe().unwrap().into();
+                    // Test executables run from `target/<profile>/deps`.
                     let mut expected: PathBuf = exe.parent().unwrap()
-                        .parent().unwrap()
-                        .parent().unwrap()
-                        .parent().unwrap()
                         .parent().unwrap()
                         .parent().unwrap()
                         .into();

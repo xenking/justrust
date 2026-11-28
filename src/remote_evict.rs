@@ -411,6 +411,19 @@ impl Registry {
 /// never starts on a half-deleted `target/`.
 pub struct RootLock(#[allow(dead_code)] std::fs::File);
 
+/// Unlock explicitly instead of on close. A process this one is forking shares
+/// the open file until it execs and would keep the lock that long: an
+/// eviction pass that locks a root twice in a row (outputs, then the target)
+/// then skipped the root as held by a build.
+#[cfg(unix)]
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: owned open descriptor.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 #[cfg(unix)]
 fn validate_lock_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -1416,8 +1429,13 @@ mod tests {
             collect(&reg, &base, Mode::Off, DEFAULT_GRACE, &p, &mut |_| {}),
             0
         );
-        let freed = collect(&reg, &base, Mode::On, DEFAULT_GRACE, &p, &mut |_| {});
-        assert_eq!(freed, 12 * GIB);
+        // The log is the only record of why a pass skipped a target: keep it
+        // for the failure message (this test has failed under parallel load).
+        let mut lines = Vec::new();
+        let freed = collect(&reg, &base, Mode::On, DEFAULT_GRACE, &p, &mut |l| {
+            lines.push(l)
+        });
+        assert_eq!(freed, 12 * GIB, "{lines:#?}");
         assert!(!a.join("target").exists());
         assert!(a.join("src/lib.rs").exists());
         std::fs::remove_dir_all(&base).unwrap();

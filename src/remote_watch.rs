@@ -57,10 +57,13 @@ impl ChangedBatch {
     }
 }
 
+// Only `record_batch` (inotify, Linux) fills the file log.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const MAX_DIRTY_FILES: usize = 2048;
 const MAX_RESCAN_DIRS: usize = 256;
 
 #[derive(Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct DirtyLog {
     /// Generation of the last fully committed kernel event batch.
     seq: u64,
@@ -943,6 +946,22 @@ mod tests {
         assert!(f());
     }
 
+    /// `dirty_since` fails closed when the reader thread has not caught up
+    /// within a few milliseconds, which a loaded machine does not promise.
+    /// A root that must fail closed for good stays `None` however long this
+    /// waits.
+    #[cfg(target_os = "linux")]
+    fn dirty_when_synced(w: &Watcher, root: &Path, event_gen: u64) -> Option<(u64, Vec<PathBuf>)> {
+        let t = std::time::Instant::now();
+        loop {
+            let got = w.dirty_since(root, event_gen);
+            if got.is_some() || t.elapsed() >= Duration::from_secs(2) {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn dirty_since_isolates_roots_and_tracks_exact_file_edits() {
@@ -975,10 +994,16 @@ mod tests {
         std::fs::remove_dir_all(root_b.join("sub")).unwrap();
         wait(|| !w.is_watched(&root_b.join("sub")));
 
-        let (gen1, dirty_a) = w
-            .dirty_since(&root_a, gen0)
+        let (gen1, dirty_a) = dirty_when_synced(&w, &root_a, gen0)
             .expect("root_a must remain clean despite root_b churn");
-        assert!(dirty_a.is_empty());
+        // Nothing of root_b's, and nothing new in root_a. The one event that
+        // can still arrive is the close of the fixture file written before
+        // the watch: a child another test is forking holds a copy of that
+        // descriptor until it execs, and the kernel reports the close then.
+        assert!(
+            dirty_a.iter().all(|p| *p == root_a.join("src/lib.rs")),
+            "{dirty_a:?}"
+        );
         assert!(gen1 > gen0);
         // root_b had a directory deletion, so it must fail closed to a full scan.
         assert!(w.dirty_since(&root_b, gen0).is_none());
@@ -986,9 +1011,17 @@ mod tests {
         // Single-file edit inside root_a reports only that exact path.
         std::fs::write(root_a.join("src/lib.rs"), "v2").unwrap();
         recv_until(&rx, &root_a.join("src"));
-        let (gen2, dirty_a2) = w
-            .dirty_since(&root_a, gen1)
-            .expect("single file edit under root_a should be incremental");
+        // That notification can be the fixture's late close (see above), so
+        // wait for the edit itself to be recorded.
+        let t = std::time::Instant::now();
+        let (gen2, dirty_a2) = loop {
+            let got = dirty_when_synced(&w, &root_a, gen1)
+                .expect("single file edit under root_a should be incremental");
+            if !got.1.is_empty() || t.elapsed() >= Duration::from_secs(5) {
+                break got;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(dirty_a2, vec![root_a.join("src/lib.rs")]);
         assert!(gen2 > gen1);
 

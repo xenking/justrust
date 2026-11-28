@@ -40,9 +40,10 @@ use crate::paths;
 use crate::sys::net::{UnixListener, UnixStream};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -69,12 +70,21 @@ pub fn enabled(agent: bool) -> bool {
     }
 }
 
+/// Binaries side by side: a quarter of the cores. Cargo hands binaries over
+/// in its own order within a few milliseconds, so one that arrives with the
+/// cap reached waits for a whole earlier binary, whatever its priority: on
+/// 96 cores a cap of 8 held the binary that set the suite's wall time back
+/// by up to 4.5 s (0.7 s per 23-binary run on average).
+fn default_jobs(ncpu: usize) -> usize {
+    (ncpu / 4).clamp(2, 24)
+}
+
 fn max_jobs() -> usize {
     std::env::var("JUSTRUST_TEST_JOBS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or_else(|| (crate::procfs::ncpu() / 4).clamp(2, 8))
+        .unwrap_or_else(|| default_jobs(crate::procfs::ncpu()))
 }
 
 /// One binary handed over by the runner.
@@ -457,16 +467,21 @@ fn run_job(inner: &Arc<Inner>, job: Job) {
                     execute(inner, &job.req, &g.args, &job.stem)
                 };
                 fin.hide_filtered = g.hide_filtered;
+                // A crash is a failure even when the rerun alone completes: the
+                // rerun restores the totals, it does not make the death go away.
+                let crash = crash_line(&fin);
+                let first_exit = fin.exit;
                 let overlapped = inner.state.lock().unwrap().overlapped.contains(&job.id);
-                // A process that died is not a flaky test: rerunning names alone
-                // would hide that its remaining tests never ran.
-                if crash_reason(&fin).is_none()
-                    && should_confirm(fin.exit, overlapped, cancellation_signal())
-                {
+                if should_confirm(fin.exit, overlapped, cancellation_signal()) {
                     // It ran next to other test processes: confirm alone.
                     fin = confirm_alone(inner, &job.req, &job.stem, &g.args, fin);
                 }
-                mark_crash(&mut fin);
+                if let Some(line) = crash {
+                    fin.lines.push((paths::now(), "e", line.into_bytes()));
+                    if fin.exit == 0 {
+                        fin.exit = if first_exit == 0 { 1 } else { first_exit };
+                    }
+                }
                 report(inner, &fin);
                 let mut st = inner.state.lock().unwrap();
                 if fin.exit != 0 && inner.fail_fast {
@@ -556,43 +571,40 @@ fn execute(inner: &Inner, req: &Request, args: &[String], stem: &str) -> Finishe
         "e",
         format!("justrust: test process started: {stem} (pid {pid})").into_bytes(),
     )]);
-    let read = |r: Box<dyn Read + Send>, s: &'static str| {
-        let sink = inner.sink.clone();
-        let stem = stem.to_owned();
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let mut r = BufReader::new(r);
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match r.read_until(b'\n', &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                let line = buf.strip_suffix(b"\n").unwrap_or(&buf).to_vec();
-                let now = paths::now();
-                if long_running_warning(&line) {
-                    // These are diagnostics, not outcomes. Send them while the
-                    // child is alive, including during confirmation retries.
-                    // Do not replay them in the final authoritative block.
-                    let mut diagnostic = format!("justrust: {stem} (pid {pid}): ").into_bytes();
-                    diagnostic.extend_from_slice(&line);
-                    sink.emit_block(&[(now, "e", diagnostic)]);
-                } else {
-                    out.push((now, s, line));
-                }
-            }
-            out
-        })
-    };
-    let to = read(Box::new(child.stdout.take().unwrap()), "o");
-    let te = read(Box::new(child.stderr.take().unwrap()), "e");
+    let exited = Arc::new(AtomicBool::new(false));
+    let label = format!("{stem} (pid {pid})");
+    let to = read_output(
+        child.stdout.take().unwrap(),
+        "o",
+        &exited,
+        &inner.sink,
+        &label,
+    );
+    let te = read_output(
+        child.stderr.take().unwrap(),
+        "e",
+        &exited,
+        &inner.sink,
+        &label,
+    );
     let u = crate::sys::wait_usage(&mut child, job.as_ref());
     let reaped = paths::now();
+    exited.store(true, Ordering::Release);
     let (exit, cpu) = (u.code, u.user + u.sys);
-    let mut lines = to.join().unwrap_or_default();
-    lines.extend(te.join().unwrap_or_default());
+    let (mut lines, out_held) = to.join().unwrap_or_default();
+    let (err_lines, err_held) = te.join().unwrap_or_default();
+    lines.extend(err_lines);
     lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if out_held || err_held {
+        lines.push((
+            paths::now(),
+            "e",
+            format!(
+                "justrust: {stem}: exited with a process it started still holding its output open; not waiting for that process"
+            )
+            .into_bytes(),
+        ));
+    }
     LIVE_PIDS.lock().unwrap().retain(|&p| p != pid);
     track_signal_pid(pid, false);
     {
@@ -614,6 +626,69 @@ fn execute(inner: &Inner, req: &Request, args: &[String], stem: &str) -> Finishe
         outcomes,
         hide_filtered: None,
     }
+}
+
+type OutputLines = Vec<(f64, &'static str, Vec<u8>)>;
+
+/// Read one output stream (`s`: "o" or "e") of a test process on a thread:
+/// its lines, and whether the stream was still open when reading stopped.
+///
+/// Reading stops at end-of-file, or once the process has exited (`exited`)
+/// and everything it wrote has been read. The second case is a process the
+/// tests started (a daemon, a `sleep`) that outlives the test binary with
+/// the pipe inherited: a test binary that aborted left a `sleep 30` behind
+/// and was reported 30 seconds late, twice with its confirmation run. Cargo
+/// does not wait for such a process either; the test binary writes straight
+/// to cargo's own output there.
+fn read_output<R: crate::sys::OutputPipe>(
+    mut r: R,
+    s: &'static str,
+    exited: &Arc<AtomicBool>,
+    sink: &Arc<dyn Sink>,
+    label: &str,
+) -> std::thread::JoinHandle<(OutputLines, bool)> {
+    let (exited, sink, label) = (exited.clone(), sink.clone(), label.to_owned());
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut partial = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut held = false;
+        loop {
+            if !r.more(&exited) {
+                held = true;
+                break;
+            }
+            let n = match r.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let now = paths::now();
+            partial.extend_from_slice(&chunk[..n]);
+            while let Some(i) = partial.iter().position(|&b| b == b'\n') {
+                let rest = partial.split_off(i + 1);
+                let mut line = std::mem::replace(&mut partial, rest);
+                line.pop();
+                if long_running_warning(&line) {
+                    // These are diagnostics, not outcomes. Send them while the
+                    // child is alive, including during confirmation retries.
+                    // Do not replay them in the final authoritative block.
+                    let mut diagnostic = format!("justrust: {label}: ").into_bytes();
+                    diagnostic.extend_from_slice(&line);
+                    sink.emit_block(&[(now, "e", diagnostic)]);
+                } else {
+                    out.push((now, s, line));
+                }
+            }
+        }
+        // Output that ends without a newline, such as libtest's `test x ... `
+        // before the test that killed the process.
+        if !partial.is_empty() {
+            out.push((paths::now(), s, partial));
+        }
+        (out, held)
+    })
 }
 
 /// Only libtest's standalone timeout warning is safe to publish before
@@ -737,7 +812,10 @@ fn confirm_alone(
         }
         Some(failed_names(&r).into_iter().map(str::to_owned).collect())
     };
-    let selective = selective_retry_is_cheap(&first);
+    // A process that died mid-run (abort, signal) left tests without an
+    // outcome. Its named failures do not account for them, so settling the
+    // names alone would report tests that never finished as passed.
+    let selective = selective_retry_is_cheap(&first) && ran_to_end(&first);
     if !failed.is_empty() && selective {
         // Quick check, next to whatever else runs: a real failure does not
         // wait for the pool to drain.
@@ -818,14 +896,18 @@ fn confirm_alone(
         .filter(|f| alone_passed.contains(f))
         .collect();
     if alone.exit == 0 || !flaky.is_empty() {
-        let what = if failed.is_empty() {
-            format!("exited with code {}", first.exit)
+        let note = if failed.is_empty() {
+            format!(
+                "justrust: {stem} exited with code {} while other test processes ran in parallel, and passed when run alone; reporting the run alone",
+                first.exit
+            )
         } else {
-            format!("failed ({})", flaky.join(", "))
+            format!(
+                "justrust: {stem}: {} tests failed in parallel and passed alone: {}; reporting the run alone",
+                flaky.len(),
+                flaky.join(", ")
+            )
         };
-        let note = format!(
-            "justrust: {stem} {what} while other test processes ran in parallel, and passed when run alone; reporting the run alone"
-        );
         alone.lines.push((paths::now(), "e", note.into_bytes()));
     }
     alone
@@ -857,9 +939,7 @@ fn line_text(l: &(f64, &'static str, Vec<u8>)) -> String {
 /// 0 or 101 and always prints a `test result:` line. Anything else (a signal,
 /// an abort, another status, or no summary) means tests were lost.
 fn crash_reason(f: &Finished) -> Option<String> {
-    let summary = f.lines.iter().any(|l| {
-        line_text(l).starts_with("test result: ") || line_text(l).contains("test result: ")
-    });
+    let summary = ran_to_end(f);
     if (f.exit == 0 || f.exit == 101) && summary {
         return None;
     }
@@ -883,9 +963,9 @@ fn tests_not_run(f: &Finished) -> u64 {
         .iter()
         .find_map(|l| {
             let t = line_text(l);
-            t.strip_prefix("running ")?
-                .strip_suffix(" tests")
-                .or_else(|| t.strip_prefix("running ")?.strip_suffix(" test"))?
+            let rest = t.strip_prefix("running ")?;
+            rest.strip_suffix(" tests")
+                .or_else(|| rest.strip_suffix(" test"))?
                 .parse::<u64>()
                 .ok()
         })
@@ -904,20 +984,14 @@ fn tests_not_run(f: &Finished) -> u64 {
     announced.saturating_sub(reported)
 }
 
-/// Report a crash loudly and make sure the process counts as failed.
-fn mark_crash(f: &mut Finished) {
-    let Some(why) = crash_reason(f) else {
-        return;
-    };
-    if f.exit == 0 {
-        f.exit = 1;
-    }
-    let msg = format!(
+/// The loud report for a crashed process, or `None` when it ran to the end.
+fn crash_line(f: &Finished) -> Option<String> {
+    let why = crash_reason(f)?;
+    Some(format!(
         "{CRASH_PREFIX}{}: {why}; {} tests did not run",
         f.stem,
         tests_not_run(f)
-    );
-    f.lines.push((paths::now(), "e", msg.into_bytes()));
+    ))
 }
 
 fn failed_names(f: &Finished) -> Vec<&str> {
@@ -928,10 +1002,21 @@ fn failed_names(f: &Finished) -> Vec<&str> {
         .collect()
 }
 
+/// libtest printed its `test result:` line, so every test it ran has an
+/// outcome. Without it the process died first (a panic that could not
+/// unwind, a signal, `process::exit` in a test).
+fn ran_to_end(f: &Finished) -> bool {
+    f.lines.iter().any(|(_, _, l)| {
+        String::from_utf8_lossy(l)
+            .trim_start()
+            .starts_with("test result: ")
+    })
+}
+
 /// `f` with the tests in `flaky` counted as passed: their outcome, their
 /// `test x ... FAILED` line, and the `test result:` counts. The process
-/// exits 0 when nothing else failed. Their failure output stays (it is the
-/// evidence), with the note the caller adds.
+/// exits 0 when nothing else failed and it ran to the end. Their failure
+/// output stays (it is the evidence), with the note the caller adds.
 fn drop_failures(mut f: Finished, flaky: &[&str]) -> Finished {
     let flaky: HashSet<String> = flaky.iter().map(|s| s.to_string()).collect();
     for o in &mut f.outcomes {
@@ -953,7 +1038,7 @@ fn drop_failures(mut f: Finished, flaky: &[&str]) -> Finished {
             *l = adjust_result(&text, n).into_bytes();
         }
     }
-    if failed_names(&f).is_empty() {
+    if failed_names(&f).is_empty() && ran_to_end(&f) {
         f.exit = 0;
     }
     f
@@ -1565,6 +1650,195 @@ mod tests {
         assert!(failed_names(&h).is_empty());
     }
 
+    /// Run 20261125-204126511-1296150: a 1128-test process printed one
+    /// FAILED line and then aborted ("failed to initiate panic"). The named
+    /// test passed alone, the exit status was cleared, and the run was
+    /// reported as "ok: 259 tests passed" with 870 outcomes missing.
+    #[test]
+    fn a_process_that_died_mid_run_keeps_its_exit_status() {
+        let mut f = fin(&[("a::x", false, 0.1), ("a::z", true, 0.1)]);
+        f.exit = 134;
+        f.lines = vec![
+            (0.0, "o", b"test a::x ... FAILED <0.100s>".to_vec()),
+            (0.0, "o", b"test a::z ... ok <0.100s>".to_vec()),
+            (
+                0.0,
+                "e",
+                b"fatal runtime error: failed to initiate panic, error 5, aborting".to_vec(),
+            ),
+        ];
+        assert!(!ran_to_end(&f));
+        let g = drop_failures(f, &["a::x"]);
+        assert!(failed_names(&g).is_empty());
+        assert_eq!(g.exit, 134);
+    }
+
+    /// The same process end to end: the failed name passes by itself, the
+    /// whole process dies again, so the failure stands.
+    #[cfg(unix)]
+    #[test]
+    fn a_crash_is_not_settled_by_rerunning_its_named_failure() {
+        let dir = TmpDir(std::env::temp_dir().join(format!("jr-crash-{}", std::process::id())));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let bin = dir.path().join("crash");
+        let calls = dir.path().join("calls");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *--exact*) echo 'test t0 ... ok'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s'; exit 0;; esac\necho 'test t0 ... ok'\necho 'fatal runtime error: failed to initiate panic, error 5, aborting' >&2\nexit 134\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        crate::sys::set_mode(&bin, 0o755).unwrap();
+        let sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let pool = Pool::start(dir.path(), dir.path(), Path::new("jr"), sink, true).unwrap();
+        let req = Request {
+            bin: bin.to_string_lossy().into_owned(),
+            args: s(&["group"]),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            env: Vec::new(),
+        };
+        let mut first = fin(&[("t0", false, 0.1)]);
+        first.exit = 134;
+        first.lines = vec![(0.0, "o", b"test t0 ... FAILED <0.100s>".to_vec())];
+        let result = confirm_alone(&pool.inner, &req, "crash", &req.args, first);
+        assert_eq!(result.exit, 134);
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert!(!calls.contains("--exact"), "{calls}");
+        pool.finish();
+    }
+
+    /// A test binary that dies and leaves a child holding its stdout is
+    /// reported when it exits, with everything it printed, not when the
+    /// child lets go of the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn an_orphan_holding_the_output_does_not_delay_the_report() {
+        let dir = TmpDir(std::env::temp_dir().join(format!("jr-orphan-{}", std::process::id())));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let bin = dir.path().join("orphan");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nsleep 20 &\necho 'test t0 ... ok'\nprintf 'test t1 ... '\necho 'fatal runtime error: aborting' >&2\nexit 134\n",
+        )
+        .unwrap();
+        crate::sys::set_mode(&bin, 0o755).unwrap();
+        let sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let pool = Pool::start(dir.path(), dir.path(), Path::new("jr"), sink, true).unwrap();
+        let req = Request {
+            bin: bin.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            env: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let f = execute(&pool.inner, &req, &req.args, "orphan");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        assert_eq!(f.exit, 134);
+        let text: Vec<String> = f
+            .lines
+            .iter()
+            .map(|(_, _, l)| String::from_utf8_lossy(l).into_owned())
+            .collect();
+        assert!(text.iter().any(|l| l == "test t0 ... ok"), "{text:?}");
+        assert!(text.iter().any(|l| l == "test t1 ... "), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("fatal runtime error")),
+            "{text:?}"
+        );
+        assert!(
+            text.last()
+                .unwrap()
+                .contains("still holding its output open"),
+            "{text:?}"
+        );
+        assert_eq!(f.outcomes.len(), 1);
+        pool.finish();
+    }
+
+    /// Output is complete and unannotated when nothing outlives the process,
+    /// including a last line without a newline.
+    #[cfg(unix)]
+    #[test]
+    fn output_of_a_plain_process_is_captured_whole() {
+        let dir = TmpDir(std::env::temp_dir().join(format!("jr-plain-{}", std::process::id())));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let bin = dir.path().join("plain");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 3000 ]; do echo \"test t$i ... ok\"; i=$((i+1)); done\nprintf 'tail without newline'\n",
+        )
+        .unwrap();
+        crate::sys::set_mode(&bin, 0o755).unwrap();
+        let sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let pool = Pool::start(dir.path(), dir.path(), Path::new("jr"), sink, true).unwrap();
+        let req = Request {
+            bin: bin.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            env: Vec::new(),
+        };
+        let f = execute(&pool.inner, &req, &req.args, "plain");
+        assert_eq!(f.exit, 0);
+        assert_eq!(f.outcomes.len(), 3000);
+        assert_eq!(f.lines.len(), 3001);
+        assert_eq!(f.lines.last().unwrap().2, b"tail without newline");
+        assert_eq!(f.lines[2999].2, b"test t2999 ... ok");
+        pool.finish();
+    }
+
+    /// Another thread starting a process holds every open pipe for a moment,
+    /// between its fork and its exec. That is not a process the test binary
+    /// left behind: no note, and the output has exactly its own lines.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_starting_elsewhere_is_not_taken_for_one_holding_the_output() {
+        let dir = TmpDir(std::env::temp_dir().join(format!("jr-forks-{}", std::process::id())));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let bin = dir.path().join("plain");
+        std::fs::write(&bin, "#!/bin/sh\necho 'test t ... ok'\nprintf 'tail'\n").unwrap();
+        crate::sys::set_mode(&bin, 0o755).unwrap();
+        let sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let pool = Pool::start(dir.path(), dir.path(), Path::new("jr"), sink, true).unwrap();
+        let req = Request {
+            bin: bin.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            env: Vec::new(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let forkers: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+        let noted = (0..150)
+            .filter(|_| execute(&pool.inner, &req, &req.args, "plain").lines.len() != 2)
+            .count();
+        stop.store(true, Ordering::Relaxed);
+        for t in forkers {
+            t.join().unwrap();
+        }
+        assert_eq!(noted, 0, "of 150 runs");
+        pool.finish();
+    }
+
+    #[test]
+    fn job_cap_follows_the_cores_of_a_large_machine() {
+        assert_eq!(default_jobs(1), 2);
+        assert_eq!(default_jobs(16), 4);
+        assert_eq!(default_jobs(32), 8);
+        assert_eq!(default_jobs(96), 24);
+        assert_eq!(default_jobs(256), 24);
+    }
+
     fn finished(exit: i32, lines: &[&str]) -> Finished {
         Finished {
             bin: "b".into(),
@@ -1587,50 +1861,42 @@ mod tests {
     #[test]
     fn a_clean_pass_and_a_real_failure_are_not_crashes() {
         assert_eq!(
-            crash_reason(&finished(0, &["running 2 tests", SUMMARY_OK])),
+            crash_line(&finished(0, &["running 2 tests", SUMMARY_OK])),
             None
         );
         assert_eq!(
-            crash_reason(&finished(101, &["running 2 tests", SUMMARY_FAILED])),
+            crash_line(&finished(101, &["running 2 tests", SUMMARY_FAILED])),
             None
         );
     }
 
     #[test]
     fn a_process_killed_by_sigpipe_mid_run_is_a_crash_with_its_lost_tests_counted() {
-        let mut f = finished(
+        let f = finished(
             128 + 13,
             &["running 4 tests", "test a ... ok", "test b ... FAILED"],
         );
-        assert_eq!(
-            crash_reason(&f).as_deref(),
-            Some("died by signal 13 (SIGPIPE) before its test summary")
-        );
         assert_eq!(tests_not_run(&f), 2);
-        mark_crash(&mut f);
-        let last = line_text(f.lines.last().unwrap());
         assert_eq!(
-            last,
-            "justrust: crashed: b-1: died by signal 13 (SIGPIPE) before its test summary; 2 tests did not run"
+            crash_line(&f).as_deref(),
+            Some(
+                "justrust: crashed: b-1: died by signal 13 (SIGPIPE) before its test summary; 2 tests did not run"
+            )
         );
-        assert_eq!(f.exit, 141);
     }
 
     #[test]
-    fn exiting_without_a_summary_is_a_crash_even_with_status_zero() {
-        let mut f = finished(0, &["running 3 tests", "test a ... ok"]);
+    fn exiting_without_a_summary_or_with_a_foreign_status_is_a_crash() {
         assert!(
-            crash_reason(&f)
+            crash_line(&finished(0, &["running 3 tests", "test a ... ok"]))
                 .unwrap()
                 .contains("before its test summary")
         );
-        mark_crash(&mut f);
-        assert_ne!(f.exit, 0);
-        assert!(crash_reason(&finished(3, &["running 1 test", SUMMARY_OK])).is_some());
+        assert!(crash_line(&finished(3, &["running 1 test", SUMMARY_OK])).is_some());
     }
 
     #[test]
-    fn a_flaky_failure_is_still_forgiven_only_as_an_explicit_line() {
+    fn a_flaky_failure_is_forgiven_only_as_an_explicit_line_and_is_not_a_crash() {
         let mut f = finished(
             101,
             &[
@@ -1652,10 +1918,10 @@ mod tests {
                 secs: None,
             },
         ];
-        assert!(crash_reason(&f).is_none());
+        assert!(crash_line(&f).is_none());
         let g = drop_failures(f, &["a"]);
         assert_eq!(g.exit, 0);
-        assert!(crash_reason(&g).is_none());
+        assert!(crash_line(&g).is_none());
     }
 
     #[test]
@@ -1968,16 +2234,21 @@ mod tests {
         assert!(!should_confirm(101, true, libc::SIGTERM));
         assert!(!should_confirm(101, true, libc::SIGINT));
         assert!(!should_confirm(0, true, 0));
-        let status = Command::new(std::env::current_exe().unwrap())
+        let nested = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "test_pool::tests::cancellation_does_not_spawn_or_confirm_tests",
                 "--nocapture",
             ])
             .env(FLAG, "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(
+            nested.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&nested.stdout),
+            String::from_utf8_lossy(&nested.stderr)
+        );
     }
 
     /// A child waits for the sink to acknowledge its warning. Buffering until

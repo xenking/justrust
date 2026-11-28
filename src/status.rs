@@ -459,6 +459,9 @@ fn scan_run_ids(runs: &Path) -> Vec<String> {
     let mut overrides = Vec::new();
     if let Ok(entries) = std::fs::read_dir(runs) {
         for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                continue;
+            }
             let Ok(id) = entry.file_name().into_string() else {
                 continue;
             };
@@ -1081,7 +1084,16 @@ mod tests {
         index.write_all(b"{}\n").unwrap();
         assert!(wake.drain().unwrap());
         drop(index);
-        assert!(wake.drain().unwrap());
+        // IN_CLOSE_WRITE fires once the last descriptor on the open file closes;
+        // a sibling test forking a child can hold the O_CLOEXEC fd until exec().
+        let close_wait = std::time::Instant::now();
+        while !wake.drain().unwrap() {
+            assert!(
+                close_wait.elapsed() < std::time::Duration::from_secs(5),
+                "IN_CLOSE_WRITE did not arrive after closing index.jsonl"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         std::fs::write(dir.join("index.tmp"), "replacement").unwrap();
         std::fs::rename(dir.join("index.tmp"), dir.join("index.jsonl")).unwrap();
         assert!(wake.drain().unwrap());
@@ -1089,7 +1101,14 @@ mod tests {
         assert!(wake.drain().unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
         // Losing either directory switches permanently to timed fallback.
-        assert!(!wake.wait(Some(0.01)));
+        // The kernel reports the loss once the last descriptor on the
+        // directory closes, and a child another test is forking can hold the
+        // one the removal used until it execs. Until then the deletions inside
+        // it are ordinary wakes.
+        let lost = std::time::Instant::now();
+        while wake.wait(Some(0.01)) {
+            assert!(lost.elapsed() < std::time::Duration::from_secs(5));
+        }
         assert!(wake.fd.is_none());
         assert!(!wake.wait(Some(0.01)));
     }

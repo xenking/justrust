@@ -54,8 +54,18 @@ use sync_queue::SyncQueue;
 const IDLE_EXIT: Duration = Duration::from_secs(3600);
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn daemon_file(name: &str) -> Result<PathBuf> {
+    let dir = crate::remote::dir()?;
+    let platform = crate::remote_windows::selected_platform().unwrap_or("linux");
+    if platform == "linux" {
+        Ok(dir.join(name))
+    } else {
+        Ok(dir.join(format!("{platform}-{name}")))
+    }
+}
+
 pub fn sock_path() -> Result<PathBuf> {
-    Ok(crate::remote::dir()?.join("daemon.sock"))
+    daemon_file("daemon.sock")
 }
 
 /// Content identity, cached once so reinstalling identical bytes keeps the daemon.
@@ -66,9 +76,114 @@ pub fn build_id() -> String {
         let executable = crate::procfs::running_executable();
         #[cfg(not(unix))]
         let executable = std::env::current_exe().and_then(std::fs::File::open);
-        binary_identity(executable.and_then(binary_digest))
+        let cache = crate::paths::home().ok().map(|home| home.join("build-id"));
+        binary_identity(executable.and_then(|file| file_digest(cache.as_deref(), file)))
     })
     .clone()
+}
+
+/// Digest of an open executable, remembered across processes: every process
+/// that names its build used to read its whole executable first (1.33 s for
+/// the 174 MB debug client, 11 ms for the 20 MB release one).
+///
+/// The stored digest is only used for the same file in the same state:
+/// device, inode, size, and modification and status-change times in
+/// nanoseconds. Rewriting a file in place moves its status-change time even
+/// when the modification time is put back, and an installer's replacement is
+/// another inode. Anything else (no cache directory, no entry, another key,
+/// a damaged entry) hashes the bytes, as before.
+fn file_digest(cache: Option<&Path>, file: std::fs::File) -> std::io::Result<String> {
+    let Some((cache, key)) = cache.zip(digest_key(&file)) else {
+        return binary_digest(file);
+    };
+    let entry = cache.join(key.split(' ').take(2).collect::<Vec<_>>().join("-"));
+    if let Some(digest) = stored_digest(&entry, &key) {
+        return Ok(digest);
+    }
+    let digest = binary_digest(&file)?;
+    // The file may have been written while it was read: only remember a
+    // digest of a state that held from before the read until after it.
+    if digest_key(&file).as_deref() == Some(&key) {
+        store_digest(cache, &entry, &key, &digest);
+    }
+    Ok(digest)
+}
+
+/// `<device> <inode> <size> <mtime ns> <ctime ns>` of an open file.
+#[cfg(unix)]
+fn digest_key(file: &std::fs::File) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().ok()?;
+    Some(format!(
+        "{} {} {} {}.{:09} {}.{:09}",
+        m.dev(),
+        m.ino(),
+        m.size(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec()
+    ))
+}
+
+#[cfg(not(unix))]
+fn digest_key(_: &std::fs::File) -> Option<String> {
+    None
+}
+
+fn stored_digest(entry: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(entry).ok()?;
+    let (stored_key, digest) = text.strip_suffix('\n')?.rsplit_once(' ')?;
+    let hex = digest.strip_prefix("sha256-")?;
+    let valid = hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (stored_key == key && valid).then(|| digest.to_owned())
+}
+
+/// Best effort: a digest that cannot be stored is computed again next time.
+fn store_digest(cache: &Path, entry: &Path, key: &str, digest: &str) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if std::fs::create_dir_all(cache).is_err() {
+        return;
+    }
+    let tmp = cache.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    // Readers see the old entry or the whole new one, never a partial line.
+    if std::fs::write(&tmp, format!("{key} {digest}\n")).is_err()
+        || std::fs::rename(&tmp, entry).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    prune_digests(cache, entry, 256, Duration::from_secs(7 * 24 * 3600));
+}
+
+/// Every relinked development binary is a new inode with its own entry:
+/// past `keep` entries, drop the ones not written for `older_than`.
+fn prune_digests(cache: &Path, mine: &Path, keep: usize, older_than: Duration) {
+    let Ok(rd) = std::fs::read_dir(cache) else {
+        return;
+    };
+    let entries: Vec<_> = rd.flatten().collect();
+    if entries.len() <= keep {
+        return;
+    }
+    for e in entries {
+        let old = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if old && e.path() != mine {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 fn binary_digest(mut reader: impl Read) -> std::io::Result<String> {
@@ -272,7 +387,7 @@ pub fn connect() -> Result<UnixStream> {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(crate::remote::dir()?.join("daemon.lock"))?;
+        .open(daemon_file("daemon.lock")?)?;
     if let Some(s) = wait_for_daemon_lock(
         &lock,
         Duration::from_secs(30),
@@ -461,6 +576,8 @@ struct Link {
     stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     routes: Mutex<Routes>,
     mirror: Mirror,
+    /// Transport drops this link's durable session reattached through.
+    outage: Arc<Outage>,
     /// Peer dependency cache over this session (`src/peercache.rs`).
     peer: Arc<peercache::Relay>,
     /// The agent serves `Checkpoint` and `Verify`, and this daemon uses them.
@@ -565,9 +682,70 @@ impl InstallRetry {
     }
 }
 
+/// After a failed handshake: must the machine's justrust be installed again?
+///
+/// Only an agent that answered in another protocol version shows that some
+/// other build replaced the binary. No answer (a dropped link, a closed
+/// stream) used to count as that too, so every drop cost a full install over
+/// the link that had just failed: seven in half an hour on 2026-11-27, 28 to
+/// 165 s each against 0.7 s for a handshake. Now the machine is asked, in one
+/// command, and its binary is replaced only if it says it is another one.
+fn stamp_is_stale(answered: Option<u32>, intact: impl FnOnce() -> Option<bool>) -> bool {
+    match answered {
+        Some(version) => version != VERSION,
+        None => intact() == Some(false),
+    }
+}
+
+/// How long a link's transport was down, from its session bridge's stderr.
+/// The bridge hides a reattached drop from the frame stream, so without this
+/// a build only looks slow to return.
+#[derive(Default)]
+struct Outage {
+    restored_us: AtomicU64,
+    down: Mutex<Option<Instant>>,
+}
+
+impl Outage {
+    /// Feed one stderr line of the bridge.
+    fn observe(&self, line: &str) {
+        if line.starts_with(crate::remote_proto::INTERRUPTED) {
+            self.down.lock().unwrap().get_or_insert_with(Instant::now);
+        } else if let Some(secs) = crate::remote_proto::restored_secs(line) {
+            self.restored_us
+                .fetch_add((secs * 1e6) as u64, Ordering::SeqCst);
+            *self.down.lock().unwrap() = None;
+        }
+    }
+
+    /// The bridge reported a drop it has not recovered from.
+    fn is_down(&self) -> bool {
+        self.down.lock().unwrap().is_some()
+    }
+
+    /// Milliseconds of outages that ended in a reattach.
+    fn restored_ms(&self) -> f64 {
+        self.restored_us.load(Ordering::SeqCst) as f64 / 1000.0
+    }
+
+    /// As `restored_ms`, for a caller holding a frame that arrived after a
+    /// reattach: stderr is read on another thread, so give its line a moment.
+    fn settled_ms(&self) -> f64 {
+        let waited = Instant::now();
+        while self.is_down() && waited.elapsed() < Duration::from_millis(100) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.restored_ms()
+    }
+}
+
 /// Everything network operations touch. Held across them.
 struct Sync {
     install_retry: InstallRetry,
+    /// Where the last connect's time went, until the run that paid reports it.
+    link_parts: Option<[Duration; 3]>,
+    /// Roots of recent builds, newest last: re-verified after a relink.
+    recent_roots: Vec<(PathBuf, Instant)>,
     // One whole-root-set receipt, never persisted or shared across connections.
     receipt: Option<(Vec<std::ffi::OsString>, String)>,
     backend: Backend,
@@ -774,6 +952,8 @@ struct Daemon {
     warm_admit: Mutex<Option<WarmAdmit>>,
     /// Pre-authorized monthly included build-allowance leases for ~0 ms warm admission.
     leases: Arc<Mutex<LeasePool>>,
+    /// Wakes `relink_loop` when a link died of a transport drop.
+    relink: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 fn hosted_admit_agent() -> ureq::Agent {
@@ -911,7 +1091,7 @@ fn daemon() -> Result<()> {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(crate::remote::dir()?.join("daemon.lock"))?;
+        .open(daemon_file("daemon.lock")?)?;
     if lock.try_lock().is_err() {
         bail!("another daemon is running");
     }
@@ -929,6 +1109,7 @@ fn daemon() -> Result<()> {
         daemon_id()
     ));
     let (wtx, wrx) = channel::<PathBuf>();
+    let (relink_tx, relink_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let d = Arc::new(Daemon {
         status_hint: Some(status_hints(sock.with_file_name("daemon-status"))),
         info: Mutex::new(Info {
@@ -938,11 +1119,14 @@ fn daemon() -> Result<()> {
         }),
         sync: SyncQueue::new(Sync {
             install_retry: Default::default(),
+            link_parts: None,
+            recent_roots: Vec::new(),
             receipt: None,
             backend,
             link: None,
             roots: BTreeMap::new(),
         }),
+        relink: Some(relink_tx),
         next_id: AtomicU64::new(1),
         watcher: Watcher::new(wtx)?,
         sock: (sock.clone(), crate::sys::file_id(&md)),
@@ -980,6 +1164,10 @@ fn daemon() -> Result<()> {
     }
     {
         let d = d.clone();
+        std::thread::spawn(move || relink_loop(&d, relink_rx));
+    }
+    {
+        let d = d.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(60));
@@ -1006,6 +1194,77 @@ fn daemon() -> Result<()> {
 
 #[path = "remote_daemon_debounce.rs"]
 mod debounce;
+
+/// After a transport drop killed the link, connect again and re-verify the
+/// mirrors of recent builds, so the next build does not wait for either.
+/// Bounded: only while a client used this daemon recently, a few attempts,
+/// and never starting a stopped machine. Builds always go first.
+fn relink_loop(d: &Daemon, rx: Receiver<()>) {
+    const ATTEMPTS: [u64; 6] = [1, 2, 4, 8, 15, 30];
+    const RECENT: Duration = Duration::from_secs(600);
+    while rx.recv().is_ok() {
+        for wait in ATTEMPTS {
+            std::thread::sleep(Duration::from_secs(wait));
+            let used = d
+                .info
+                .lock()
+                .is_ok_and(|i| i.active > 0 || i.last_client.is_some_and(|t| t.elapsed() < RECENT));
+            if d.draining.load(Ordering::SeqCst) || !used {
+                break;
+            }
+            // A build holding or waiting for the lock connects by itself.
+            let Ok(st) = d.sync.try_background_lock() else {
+                continue;
+            };
+            if st.link.as_ref().is_some_and(|l| l.alive()) {
+                break;
+            }
+            let t = Instant::now();
+            let (mut st, link) = ensure_link(d, st, false, Relock::Background);
+            let link = match link {
+                Ok(link) => link,
+                Err(e) => {
+                    log(&format!("relink: {e:#}"));
+                    continue;
+                }
+            };
+            // No run waited for this connect: none should report its parts.
+            st.link_parts = None;
+            let roots: Vec<PathBuf> = st
+                .recent_roots
+                .iter()
+                .rev()
+                .filter(|(root, at)| at.elapsed() < RECENT && root.is_dir())
+                .take(2)
+                .map(|(root, _)| root.clone())
+                .collect();
+            let mut verified = 0;
+            for root in &roots {
+                if d.sync.foreground_waiting() || !link.alive() {
+                    break;
+                }
+                if !st.needs_mirror(root) {
+                    continue;
+                }
+                match mirror_root(d, &mut st, &link, root) {
+                    Ok(_) => verified += 1,
+                    Err(e) => {
+                        st.source_sync_failed(root);
+                        log(&format!("relink: mirror {}: {e:#}", root.display()));
+                    }
+                }
+            }
+            log(&format!(
+                "relinked after a transport drop in {:.2}s, {verified} of {} recent mirror(s) re-verified",
+                t.elapsed().as_secs_f64(),
+                roots.len()
+            ));
+            break;
+        }
+        // Drops during the attempts are covered by them.
+        while rx.try_recv().is_ok() {}
+    }
+}
 
 /// Debounce watch events, then push the touched roots.
 fn push_loop(d: &Daemon, rx: Receiver<PathBuf>) {
@@ -1187,8 +1446,8 @@ fn client(stream: UnixStream, d: &Arc<Daemon>) -> Result<()> {
                 let d = d.clone();
                 std::thread::spawn(move || {
                     peercache::CONNECTING.store(true, Ordering::SeqCst);
-                    if let Ok(mut st) = d.sync.try_background_lock()
-                        && let Err(e) = ensure_link(&d, &mut st, false)
+                    if let Ok(st) = d.sync.try_background_lock()
+                        && let (_, Err(e)) = ensure_link(&d, st, false, Relock::Background)
                     {
                         log(&format!("warm: {e:#}"));
                     }
@@ -1309,7 +1568,10 @@ fn client(stream: UnixStream, d: &Arc<Daemon>) -> Result<()> {
                 let t = Instant::now();
                 let roots: Vec<PathBuf> = roots.into_iter().map(PathBuf::from).collect();
                 let mut files = 0usize;
-                if let Ok(mut st) = d.sync.foreground_lock()
+                // Speculative pre-sync must never queue behind an active or
+                // waiting foreground build: otherwise concurrent builds double-
+                // queue (once for PreSync, then again for RunSync).
+                if let Ok(mut st) = d.sync.try_background_lock()
                     && !d.draining.load(Ordering::SeqCst)
                     && let Some(link) = st.link.as_ref().filter(|l| l.alive()).cloned()
                 {
@@ -1912,39 +2174,160 @@ fn resolve_remote_prefix(
     Ok(prefix)
 }
 
+/// How long a started agent may take to answer Hello. A healthy one answers
+/// in under a second; session recovery gives up after three 10 s attempts.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Stop the process `pid` unless `greeted` is set within `timeout`.
+/// Returns whether it gave up. `greeted` is set either way, so whoever
+/// reaps the child can tell that the watchdog is finished with its pid.
+fn stop_unless_greeted(pid: i32, greeted: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if greeted.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if greeted.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    #[cfg(unix)]
+    // SAFETY: kill only signals. The child is not reaped before `greeted`
+    // is set, so the pid is still ours.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    crate::sys::terminate(pid);
+    true
+}
+
 /// Connect to the agent (starting the machine only when `start`) and begin
 /// reading frames. Invalidate known roots: only roots needed by a build are
 /// mirrored before that build, so an unrelated old workspace cannot delay it.
-fn ensure_link(d: &Daemon, st: &mut Sync, start: bool) -> Result<Arc<Link>> {
-    if let Some(l) = &st.link {
-        if l.alive() {
-            return Ok(l.clone());
+///
+/// Takes the mirror lock and gives it back, but does not hold it while the
+/// network is involved: on 2026-11-27 one connect took 427 s and eleven
+/// builds queued on the lock behind it for up to 482 s. One caller connects,
+/// the others wait for that attempt (no longer than a build may spend
+/// connecting) and find its link, or get its failure as theirs. The link is
+/// published under the lock.
+fn ensure_link<'a>(
+    d: &'a Daemon,
+    mut st: std::sync::MutexGuard<'a, Sync>,
+    start: bool,
+    relock: Relock,
+) -> (std::sync::MutexGuard<'a, Sync>, Result<Arc<Link>>) {
+    let lock = || match relock {
+        Relock::Foreground => d.sync.foreground_lock().unwrap(),
+        Relock::Background => d.sync.background_lock().unwrap(),
+    };
+    loop {
+        if let Some(l) = &st.link {
+            if l.alive() {
+                let l = l.clone();
+                return (st, Ok(l));
+            }
+            log("connection to the agent was lost, reconnecting");
         }
-        log("connection to the agent was lost, reconnecting");
+        let lead = match d.sync.connect_turn(start) {
+            sync_queue::Turn::Lead(lead) => lead,
+            sync_queue::Turn::Follow(attempt) => {
+                drop(st);
+                let followed = attempt.follow(start, crate::remote_build::connect_bound());
+                st = lock();
+                match followed {
+                    sync_queue::Followed::Connected | sync_queue::Followed::Retry => continue,
+                    sync_queue::Followed::Failed(why) => {
+                        return (
+                            st,
+                            Err(anyhow::anyhow!(
+                                "remote connect failed while this build waited for it: {why}"
+                            )),
+                        );
+                    }
+                    sync_queue::Followed::Overdue(secs) => {
+                        return (
+                            st,
+                            Err(anyhow::anyhow!(
+                                "remote connect made for another build has not finished after {secs}s"
+                            )),
+                        );
+                    }
+                }
+            }
+        };
+        drop_link(d, &mut st);
+        if !start && !st.backend.probably_up() {
+            let e = anyhow::anyhow!("remote machine is not running");
+            lead.finish(Err(format!("{e:#}")));
+            return (st, Err(e));
+        }
+        let backend = st.backend.clone();
+        let mut retry = std::mem::take(&mut st.install_retry);
+        drop(st);
+        let opened = open_link(d, &backend, &mut retry);
+        st = lock();
+        st.install_retry = retry;
+        let res = opened.and_then(|opened| {
+            // The lock was free meanwhile: this link may no longer be wanted.
+            if d.draining.load(Ordering::SeqCst) || st.backend != backend {
+                opened.link.peer.close();
+                opened.link.kill();
+                bail!("remote machine or transport changed during the connect");
+            }
+            Ok(publish_link(d, &mut st, opened))
+        });
+        // Still under the lock: whoever follows finds the link in place.
+        lead.finish(res.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")));
+        return (st, res);
     }
-    drop_link(d, st);
-    if !start && !st.backend.probably_up() {
-        bail!("remote machine is not running");
-    }
-    let target = st.backend.ensure_ready()?;
-    st.install_retry.run(&target.dest, Instant::now, || {
+}
+
+/// How a caller of [`ensure_link`] takes the mirror lock back.
+#[derive(Clone, Copy)]
+enum Relock {
+    /// A build: ahead of background work.
+    Foreground,
+    /// Warmup or relink: after any build that is waiting.
+    Background,
+}
+
+/// A connected agent that is not yet anyone's link.
+struct Opened {
+    link: Arc<Link>,
+    dest: String,
+    /// Machine ready, install, session.
+    parts: [Duration; 3],
+}
+
+/// The network part of a connect. Holds no lock.
+fn open_link(d: &Daemon, backend: &Backend, install_retry: &mut InstallRetry) -> Result<Opened> {
+    let connecting = Instant::now();
+    let target = backend.ensure_ready()?;
+    let ready = connecting.elapsed();
+    install_retry.run(&target.dest, Instant::now, || {
         crate::remote_build::ensure_remote_justrust(&target)
     })?;
-    let prefix = resolve_remote_prefix(&st.backend, &target)?;
+    let prefix = resolve_remote_prefix(backend, &target)?;
     save_active_prefix(&prefix);
-    let mut command = if st.backend == Backend::Hosted && crate::remote_session::enabled() {
-        st.install_retry.run(&target.dest, Instant::now, || {
+    let installed = connecting.elapsed();
+    let mut command = if *backend == Backend::Hosted && crate::remote_session::enabled() {
+        install_retry.run(&target.dest, Instant::now, || {
             crate::remote_session::command(&target, &prefix)
         })?
     } else {
-        let agent_cmd = if prefix.is_empty() {
-            "export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:$HOME/.homebrew/bin:/usr/local/bin:$PATH\"; exec ~/.cargo/bin/justrust __agent".to_string()
-        } else {
-            format!(
-                "export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:$HOME/.homebrew/bin:/usr/local/bin:$PATH\"; exec ~/.cargo/bin/justrust __agent {}",
-                crate::remote_build::shell_quote(&prefix)
-            )
-        };
+        // This client's own copy on the machine when it has one.
+        let agent_cmd = format!(
+            "export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:$HOME/.homebrew/bin:/usr/local/bin:$PATH\"; exec {} __agent{}",
+            crate::remote_build::machine_justrust(),
+            if prefix.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", crate::remote_build::shell_quote(&prefix))
+            }
+        );
         let mut command = target.command();
         command.arg(agent_cmd);
         command
@@ -1957,7 +2340,9 @@ fn ensure_link(d: &Daemon, st: &mut Sync, start: bool) -> Result<Arc<Link>> {
         .context("starting the remote agent")?;
     // The agent reports write failures on stderr: drain it into our log so
     // a full pipe never stalls it.
+    let outage = Arc::new(Outage::default());
     if let Some(mut e) = child.stderr.take() {
+        let outage = outage.clone();
         std::thread::spawn(move || {
             let mut s = String::new();
             let mut buf = [0u8; 4096];
@@ -1967,6 +2352,7 @@ fn ensure_link(d: &Daemon, st: &mut Sync, start: bool) -> Result<Arc<Link>> {
                 }
                 s.push_str(&String::from_utf8_lossy(&buf[..n]));
                 while let Some(i) = s.find('\n') {
+                    outage.observe(&s[..i]);
                     log(&format!("agent: {}", &s[..i]));
                     s.drain(..=i);
                 }
@@ -1983,17 +2369,49 @@ fn ensure_link(d: &Daemon, st: &mut Sync, start: bool) -> Result<Arc<Link>> {
         },
         &[],
     )?;
-    let checkpoint = match read_frame(&mut stdout) {
+    // Nothing else bounds this read: every ssh step above ends within its
+    // keepalives, but a session bridge that never hears back kept the sync
+    // lock (and every build queued on it) for as long as it lived.
+    let greeted = Arc::new(AtomicBool::new(false));
+    {
+        let (greeted, pid) = (greeted.clone(), child.id() as i32);
+        std::thread::spawn(move || {
+            if stop_unless_greeted(pid, &greeted, HELLO_TIMEOUT) {
+                log(&format!(
+                    "remote agent did not answer the handshake in {}s, gave up this connect",
+                    HELLO_TIMEOUT.as_secs()
+                ));
+            }
+        });
+    }
+    let hello = read_frame(&mut stdout);
+    // From here the watchdog must never touch the pid.
+    let timed_out = greeted.swap(true, Ordering::SeqCst) && !matches!(hello, Ok(Some(_)));
+    let checkpoint = match hello {
         Ok(Some((Msg::Hello { version, caps }, _))) if version == VERSION => {
             remote_checkpoint::enabled() && caps.iter().any(|c| c == remote_checkpoint::CAP)
         }
         other => {
             let _ = child.kill();
             let _ = child.wait();
-            // Most likely another justrust build replaced the machine's
-            // binary: install ours again on the next attempt.
-            if let Ok(d) = crate::remote::dir() {
+            let answered = match &other {
+                Ok(Some((Msg::Hello { version, .. }, _))) => Some(*version),
+                _ => None,
+            };
+            // An agent that never answered says nothing about its binary.
+            if !timed_out
+                && stamp_is_stale(answered, || {
+                    crate::remote_build::remote_justrust_intact(&target)
+                })
+                && let Ok(d) = crate::remote::dir()
+            {
                 let _ = std::fs::remove_file(d.join("remote-justrust"));
+            }
+            if timed_out {
+                bail!(
+                    "remote agent handshake timed out after {}s",
+                    HELLO_TIMEOUT.as_secs()
+                );
             }
             bail!("remote agent handshake failed: {other:?}");
         }
@@ -2009,6 +2427,7 @@ fn ensure_link(d: &Daemon, st: &mut Sync, start: bool) -> Result<Arc<Link>> {
     let link = Arc::new(Link {
         child: Mutex::new(child),
         stdin,
+        outage,
         peer: peer.clone(),
         checkpoint,
         routes: Mutex::default(),
@@ -2020,9 +2439,41 @@ fn ensure_link(d: &Daemon, st: &mut Sync, start: bool) -> Result<Arc<Link>> {
     {
         let link = link.clone();
         let hint = d.status_hint.clone();
-        std::thread::spawn(move || read_agent(&link, stdout, hint));
+        let relink = d.relink.clone();
+        std::thread::spawn(move || {
+            read_agent(&link, stdout, hint);
+            // The machine closing an idle session is not a reason to come
+            // back. A transport that dropped under a live session is.
+            if link.outage.is_down()
+                && let Some(tx) = relink
+            {
+                let _ = tx.try_send(());
+            }
+        });
     }
-    log(&format!("connected to {}", target.dest));
+    Ok(Opened {
+        link,
+        dest: target.dest.clone(),
+        parts: [
+            ready,
+            installed.saturating_sub(ready),
+            connecting.elapsed().saturating_sub(installed),
+        ],
+    })
+}
+
+/// Make an opened agent the daemon's link. Under the mirror lock.
+fn publish_link(d: &Daemon, st: &mut Sync, opened: Opened) -> Arc<Link> {
+    let Opened { link, dest, parts } = opened;
+    st.link_parts = Some(parts);
+    log(&format!(
+        "connected to {dest} in {:.2}s: ready {:.2}s, install {:.2}s, session {:.2}s",
+        parts.iter().sum::<Duration>().as_secs_f64(),
+        parts[0].as_secs_f64(),
+        parts[1].as_secs_f64(),
+        parts[2].as_secs_f64()
+    ));
+    let peer = link.peer.clone();
     peer.prefetch_keys();
     if let Ok(mut c) = d.peer.lock() {
         *c = Some(peer);
@@ -2038,7 +2489,7 @@ fn ensure_link(d: &Daemon, st: &mut Sync, start: bool) -> Result<Arc<Link>> {
     // build local (FINDINGS 65).
     st.invalidate_sources();
     update_root_info(d, st);
-    Ok(link)
+    link
 }
 
 fn read_agent(
@@ -2583,15 +3034,31 @@ fn plan_dirty_paths(root: &Path, tracked: &Root, dirty_paths: &[PathBuf]) -> Opt
         return None;
     }
     let mut plan = DirtyPlan::default();
+    let mut ignore = None;
     for full in dirty_paths {
         let rel = full.strip_prefix(root).ok()?;
         if rel.as_os_str().is_empty() {
             return None;
         }
         if rel.file_name().is_some_and(|n| {
-            n == ".gitignore" || n == ".ignore" || n == ".gitattributes" || n == ".gitmodules"
+            n == ".gitignore"
+                || n == ".ignore"
+                || n == ".gitattributes"
+                || n == ".gitmodules"
+                || n == ".justrustignore"
         }) {
             return None;
+        }
+        // A path this root's `.justrustignore` excludes is not this root's:
+        // its mirror never holds it, and a nested root (a workspace inside
+        // the excluded tree, `remote_build::excluded_root`) reports its own
+        // edits here too. Without this every such edit cost a full scan.
+        if !tracked.manifest.contains_key(rel)
+            && ignore
+                .get_or_insert_with(|| remote_sync::JustrustIgnore::load(root))
+                .matches(rel)
+        {
+            continue;
         }
         if tracked.oversized.iter().any(|p| p == rel) {
             return None;
@@ -3008,13 +3475,21 @@ fn check_sync_failures(st: &mut Sync, ack: &SyncAck, run_roots: Option<&[PathBuf
     }
     for f in failed {
         let f = Path::new(f);
-        for (root, r) in st.roots.iter_mut() {
-            if let Ok(rel) = f.strip_prefix(root) {
-                // Present: rewrite it. Absent (a failed delete): the stale
-                // entry makes the next diff delete it again.
-                r.pending_repair = true;
-                r.manifest.insert(rel.to_path_buf(), UNKNOWN);
-            }
+        // The innermost root: a root nested in a tree its enclosing root
+        // excludes owns the file, and an entry in the enclosing root's
+        // manifest would make that root's next diff delete it.
+        let owner = st
+            .roots
+            .iter_mut()
+            .filter(|(root, _)| f.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count());
+        if let Some((root, r)) = owner
+            && let Ok(rel) = f.strip_prefix(root)
+        {
+            // Present: rewrite it. Absent (a failed delete): the stale
+            // entry makes the next diff delete it again.
+            r.pending_repair = true;
+            r.manifest.insert(rel.to_path_buf(), UNKNOWN);
         }
     }
     if ack.disk_full {
@@ -3180,15 +3655,27 @@ fn run(
             Ok(())
         };
         setup_phase(w, "waiting for sync lock")?;
-        let mut st = d.sync.foreground_lock().unwrap();
+        let st = d.sync.foreground_lock().unwrap();
         let locked = t.elapsed();
         if d.draining.load(Ordering::SeqCst) {
             bail!("sync daemon transport policy changed; reconnect before starting a build");
         }
+        // The connect lets the lock go while the network is involved.
+        let told = setup_phase(w, "connecting");
+        let (mut st, link) = ensure_link(d, st, start, Relock::Foreground);
         let res = (|| -> Result<_> {
-            setup_phase(w, "connecting")?;
-            let link = ensure_link(d, &mut st, start)?;
+            told?;
+            let link = link?;
             let linked = t.elapsed();
+            // Only the run that waited for a connect reports its parts.
+            let link_parts = st
+                .link_parts
+                .take()
+                .filter(|_| linked - locked >= Duration::from_millis(1));
+            st.recent_roots.retain(|(root, _)| !roots.contains(root));
+            let now = Instant::now();
+            st.recent_roots
+                .extend(roots.iter().map(|root| (root.clone(), now)));
             setup_phase(w, "syncing")?;
             let mut files = repair_sources(d, &mut st, &link)?;
             for root in &roots {
@@ -3304,11 +3791,15 @@ fn run(
                     return Err(e);
                 }
             }
+            let part_ms = |i: usize| link_parts.map_or(0.0, |p| p[i].as_secs_f64() * 1000.0);
             let timing = crate::e2e::SyncTiming {
                 lock_ms: locked.as_secs_f64() * 1000.0,
                 link_ms: (linked - locked).as_secs_f64() * 1000.0,
                 push_ms: (pushed - linked).as_secs_f64() * 1000.0,
                 barrier_ms: (t.elapsed() - pushed).as_secs_f64() * 1000.0,
+                link_ready_ms: part_ms(0),
+                link_install_ms: part_ms(1),
+                link_session_ms: part_ms(2),
             };
             if t.elapsed() > Duration::from_millis(1000) {
                 log(&format!(
@@ -3380,10 +3871,15 @@ fn run(
             }
         });
     }
+    let outage_before = link.outage.restored_ms();
     while let Ok((msg, payload)) = rx.recv() {
         let done = matches!(msg, Msg::Exit { .. } | Msg::Error { .. });
         if done {
             finished.store(true, Ordering::SeqCst);
+            let ms = link.outage.settled_ms() - outage_before;
+            if ms > 0.0 && write_frame(w, &Msg::LinkOutage { id, ms }, &[]).is_err() {
+                break;
+            }
         }
         if write_frame(w, &msg, &payload).is_err() || done {
             break;
@@ -3623,6 +4119,129 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stored_digest_is_used_only_for_the_same_file_state() {
+        let base = std::env::temp_dir().join(format!("jr-digest-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let cache = base.join("build-id");
+        let exe = base.join("exe");
+        let digest =
+            |path: &Path| file_digest(Some(&cache), std::fs::File::open(path).unwrap()).unwrap();
+        let plain = |path: &Path| binary_digest(std::fs::File::open(path).unwrap()).unwrap();
+        let entries = || -> Vec<PathBuf> {
+            std::fs::read_dir(&cache)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        };
+
+        std::fs::write(&exe, vec![1u8; 150_000]).unwrap();
+        let first = digest(&exe);
+        assert_eq!(first, plain(&exe));
+        let stored = entries();
+        assert_eq!(stored.len(), 1, "one entry and no temporary file");
+
+        // Proof the entry is what answers: a planted digest under the same
+        // key is returned without reading the file.
+        let key = digest_key(&std::fs::File::open(&exe).unwrap()).unwrap();
+        let planted = format!("sha256-{}", "ab".repeat(32));
+        std::fs::write(&stored[0], format!("{key} {planted}\n")).unwrap();
+        assert_eq!(digest(&exe), planted);
+
+        // A damaged entry is ignored and replaced.
+        std::fs::write(&stored[0], format!("{key} sha256-short\n")).unwrap();
+        assert_eq!(digest(&exe), first);
+        std::fs::write(&stored[0], format!("{key} {first}")).unwrap();
+        assert_eq!(digest(&exe), first);
+        assert_eq!(stored_digest(&stored[0], &key), Some(first.clone()));
+
+        // Same inode, size and modification time, other bytes: the planted
+        // digest of the old state must not answer.
+        let mtime = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::fs::write(&stored[0], format!("{key} {planted}\n")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&exe, vec![2u8; 150_000]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&exe)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&exe).unwrap().modified().unwrap(), mtime);
+        let second = digest(&exe);
+        assert_eq!(second, plain(&exe));
+        assert_ne!(second, first);
+
+        // An installer's replacement is another inode with its own entry.
+        let next = base.join("next");
+        std::fs::write(&next, vec![3u8; 150_000]).unwrap();
+        std::fs::rename(&next, &exe).unwrap();
+        assert_eq!(digest(&exe), plain(&exe));
+
+        // Old entries go once there are many, the one just written stays.
+        let kept = entries().len();
+        assert!(kept >= 2);
+        let mine = entries().into_iter().next().unwrap();
+        prune_digests(&cache, &mine, kept, Duration::ZERO);
+        assert_eq!(entries().len(), kept, "nothing goes below the limit");
+        prune_digests(&cache, &mine, 1, Duration::ZERO);
+        assert_eq!(entries(), vec![mine]);
+
+        // No usable cache directory: hash, and say nothing.
+        let blocked = base.join("file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        assert_eq!(
+            file_digest(Some(&blocked), std::fs::File::open(&exe).unwrap()).unwrap(),
+            plain(&exe)
+        );
+        assert_eq!(
+            file_digest(None, std::fs::File::open(&exe).unwrap()).unwrap(),
+            plain(&exe)
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_that_never_answers_is_stopped_and_one_that_answers_is_not() {
+        let silent = || {
+            Command::new("sleep")
+                .arg("600")
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        // Never answers: the blocked read ends once the bound passes.
+        let mut child = silent();
+        let mut out = child.stdout.take().unwrap();
+        let greeted = Arc::new(AtomicBool::new(false));
+        let watch = {
+            let (greeted, pid) = (greeted.clone(), child.id() as i32);
+            std::thread::spawn(move || {
+                stop_unless_greeted(pid, &greeted, Duration::from_millis(300))
+            })
+        };
+        let start = Instant::now();
+        let mut buf = [0u8; 1];
+        assert_eq!(out.read(&mut buf).unwrap(), 0);
+        assert!(start.elapsed() < Duration::from_secs(20));
+        assert!(watch.join().unwrap());
+        assert!(greeted.load(Ordering::SeqCst));
+        assert!(!child.wait().unwrap().success());
+        // Answered in time: left alone.
+        let mut child = silent();
+        let greeted = AtomicBool::new(true);
+        assert!(!stop_unless_greeted(
+            child.id() as i32,
+            &greeted,
+            Duration::from_millis(300)
+        ));
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     #[test]
     fn binary_identity_read_failure_never_uses_partial_or_shared_digest() {
         struct Broken;
@@ -3814,6 +4433,7 @@ mod tests {
             let stdin = Arc::new(Mutex::new(BufWriter::new(child.stdin.take().unwrap())));
             let stdout = BufReader::new(child.stdout.take().unwrap());
             let link = Link {
+                outage: Arc::default(),
                 child: Mutex::new(child),
                 stdin,
                 routes: Mutex::default(),
@@ -3868,6 +4488,7 @@ mod tests {
         let stdin = Arc::new(Mutex::new(BufWriter::new(child.stdin.take().unwrap())));
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let link = Arc::new(Link {
+            outage: Arc::default(),
             child: Mutex::new(child),
             stdin,
             routes: Mutex::default(),
@@ -3886,6 +4507,8 @@ mod tests {
             status_hint: None,
             sync: SyncQueue::new(Sync {
                 install_retry: Default::default(),
+                link_parts: None,
+                recent_roots: Vec::new(),
                 receipt: None,
                 backend: Backend::Hosted,
                 link: Some(link.clone()),
@@ -3907,6 +4530,7 @@ mod tests {
             live_link_ptr: AtomicUsize::new(0),
             warm_admit: Mutex::default(),
             leases: Arc::default(),
+            relink: None,
         };
         // Simulate a sync already in progress. Retirement must not wait on it
         // or replace its link, kill its process, cancel, or resubmit its run.
@@ -4190,6 +4814,8 @@ mod tests {
         for count in [1, 20] {
             let mut sync = Sync {
                 install_retry: Default::default(),
+                link_parts: None,
+                recent_roots: Vec::new(),
                 receipt: None,
                 backend: Backend::Hosted,
                 link: None,
@@ -4278,6 +4904,7 @@ mod tests {
             .unwrap();
         let mut frames = BufReader::new(child.stdout.take().unwrap());
         let link = Arc::new(Link {
+            outage: Arc::default(),
             stdin: Arc::new(Mutex::new(BufWriter::new(child.stdin.take().unwrap()))),
             child: Mutex::new(child),
             routes: Mutex::default(),
@@ -4292,6 +4919,8 @@ mod tests {
             status_hint: None,
             sync: SyncQueue::new(Sync {
                 install_retry: Default::default(),
+                link_parts: None,
+                recent_roots: Vec::new(),
                 receipt: None,
                 backend: Backend::Hosted,
                 link: Some(link.clone()),
@@ -4310,6 +4939,7 @@ mod tests {
             live_link_ptr: AtomicUsize::new(0),
             warm_admit: Mutex::default(),
             leases: Arc::default(),
+            relink: None,
         };
         let mut st = d.sync.lock().unwrap();
         let failed_write = a.join("lib.rs").display().to_string();
@@ -4388,6 +5018,7 @@ mod tests {
             .unwrap();
         let mut frames = BufReader::new(child.stdout.take().unwrap());
         let link = Arc::new(Link {
+            outage: Arc::default(),
             stdin: Arc::new(Mutex::new(BufWriter::new(child.stdin.take().unwrap()))),
             child: Mutex::new(child),
             routes: Mutex::default(),
@@ -4411,6 +5042,8 @@ mod tests {
             status_hint: None,
             sync: SyncQueue::new(Sync {
                 install_retry: Default::default(),
+                link_parts: None,
+                recent_roots: Vec::new(),
                 receipt: None,
                 backend: Backend::Hosted,
                 link: Some(link.clone()),
@@ -4429,6 +5062,7 @@ mod tests {
             live_link_ptr: AtomicUsize::new(0),
             warm_admit: Mutex::default(),
             leases: Arc::default(),
+            relink: None,
         };
         let mut st = d.sync.lock().unwrap();
         let name = root.display().to_string();
@@ -4589,6 +5223,7 @@ mod tests {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let peer = peercache::Relay::new(true, |_, _| true);
         let link = Arc::new(Link {
+            outage: Arc::default(),
             child: Mutex::new(child),
             stdin,
             routes: Mutex::default(),
@@ -4622,6 +5257,8 @@ mod tests {
             status_hint: None,
             sync: SyncQueue::new(Sync {
                 install_retry: Default::default(),
+                link_parts: None,
+                recent_roots: Vec::new(),
                 receipt: None,
                 backend: Backend::Hosted,
                 link: Some(link.clone()),
@@ -4640,6 +5277,7 @@ mod tests {
             live_link_ptr: AtomicUsize::new(0),
             warm_admit: Mutex::default(),
             leases: Arc::default(),
+            relink: None,
         };
         watch_tx.send(base.clone()).unwrap();
         drop(watch_tx);
@@ -4697,6 +5335,8 @@ mod tests {
         };
         let mut sync = Sync {
             install_retry: Default::default(),
+            link_parts: None,
+            recent_roots: Vec::new(),
             receipt: None,
             backend: Backend::Hosted,
             link: None,
@@ -4788,6 +5428,8 @@ mod tests {
         };
         let mut sync = Sync {
             install_retry: Default::default(),
+            link_parts: None,
+            recent_roots: Vec::new(),
             receipt: None,
             backend: Backend::Hosted,
             link: None,
@@ -4954,6 +5596,42 @@ cmp "$base/expected-lib" "$live/src/lib.rs"
             !REMOTE_MIRROR_PREFIX_SCRIPT.contains("~/.justrust/"),
             "fallback remote mirror path must not overlap ~/.justrust"
         );
+    }
+
+    #[test]
+    fn only_another_version_or_a_confirmed_other_binary_costs_a_reinstall() {
+        let unasked = || -> Option<bool> { panic!("an answer needs no second question") };
+        // The agent answered in another protocol version.
+        assert!(stamp_is_stale(Some(VERSION + 1), unasked));
+        assert!(stamp_is_stale(Some(VERSION - 1), unasked));
+        // No answer: a dropped link, EOF, a transport error.
+        assert!(!stamp_is_stale(None, || None), "machine unreachable");
+        assert!(!stamp_is_stale(None, || Some(true)), "binary is ours");
+        assert!(stamp_is_stale(None, || Some(false)), "binary replaced");
+        // Seven drops in a row over a bad link: no install.
+        let installs = (0..7).filter(|_| stamp_is_stale(None, || None)).count();
+        assert_eq!(installs, 0);
+    }
+
+    #[test]
+    fn outage_counts_only_reattached_drops_and_flags_an_unrecovered_one() {
+        let o = Outage::default();
+        o.observe("justrust artifacts: unrelated");
+        assert!(!o.is_down() && o.restored_ms() == 0.0);
+        o.observe("hosted: transport interrupted, reattaching original session (1/3)");
+        o.observe("hosted: transport interrupted, reattaching original session (2/3)");
+        assert!(o.is_down());
+        // The bridge measured the silence: its figure wins over our clock.
+        o.observe("hosted: transport restored after 12.500s");
+        assert!(!o.is_down());
+        assert!((o.restored_ms() - 12_500.0).abs() < 1e-6);
+        assert!((o.settled_ms() - 12_500.0).abs() < 1e-6);
+        o.observe("hosted: transport restored after 0.250s");
+        assert!((o.restored_ms() - 12_750.0).abs() < 1e-6);
+        // A drop the bridge gave up on is what asks for a background relink.
+        o.observe("hosted: transport interrupted, reattaching original session (1/3)");
+        assert!(o.is_down());
+        assert!((o.settled_ms() - 12_750.0).abs() < 1e-6);
     }
 
     #[test]
@@ -5147,6 +5825,19 @@ cmp "$base/expected-lib" "$live/src/lib.rs"
         let gi = root.join(".gitignore");
         std::fs::write(&gi, "target/\n").unwrap();
         assert!(plan_dirty_paths(&root, &tracked, &[gi]).is_none());
+
+        // A path the root's `.justrustignore` excludes is not its to mirror:
+        // no plan entry and no full scan. Editing the ignore file rescans.
+        let ji = root.join(".justrustignore");
+        std::fs::write(&ji, "/vendor/\n").unwrap();
+        std::fs::create_dir_all(root.join("vendor/tool/src")).unwrap();
+        let vendored = root.join("vendor/tool/src/lib.rs");
+        std::fs::write(&vendored, "pub fn v() {}\n").unwrap();
+        let plan = plan_dirty_paths(&root, &tracked, std::slice::from_ref(&vendored))
+            .expect("an excluded path stays incremental");
+        assert!(plan.changed.is_empty());
+        assert!(plan.deleted.is_empty());
+        assert!(plan_dirty_paths(&root, &tracked, &[ji]).is_none());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

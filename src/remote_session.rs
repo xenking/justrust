@@ -32,6 +32,12 @@ const MAX_JOURNAL: u64 = 256 << 20;
 const MAX_PACKET: usize = 80 << 20;
 const MAX_PENDING: usize = 128 << 20;
 const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an attachment waits for its peer: for the first packet, and then
+/// between packets. Wall-clock bounds on a live transport, so the unit tests
+/// (thousands in parallel on a shared machine) do not run under them: a test
+/// thread starved for 3 s looked like a dropped client.
+const ATTACH_FIRST: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 10 });
+const ATTACH_IDLE: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 3 });
 
 fn nonblocking(input: &std::process::ChildStdin) -> std::io::Result<()> {
     let fd = input.as_raw_fd();
@@ -678,7 +684,7 @@ fn terminate(broker: &Broker, child: &mut Child, grace: Duration) {
 }
 
 fn attachment(broker: &Arc<Broker>, mut stream: UnixStream) -> Result<bool> {
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(ATTACH_FIRST))?;
     let (
         Packet::Attach {
             session,
@@ -717,8 +723,8 @@ fn attachment(broker: &Arc<Broker>, mut stream: UnixStream) -> Result<bool> {
         },
         &[],
     )?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_read_timeout(Some(ATTACH_IDLE))?;
+    stream.set_write_timeout(Some(ATTACH_IDLE))?;
     let disconnected = Arc::new(AtomicBool::new(false));
     let mut output = stream.try_clone()?;
     let writer = {
@@ -898,6 +904,16 @@ fn retryable(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Bridge stderr, read by the sync daemon: the transport dropped and the
+/// original session is being reattached.
+#[cfg(test)]
+use crate::remote_proto::restored_secs;
+use crate::remote_proto::{INTERRUPTED, RESTORED};
+
+fn restored_line(silent: Duration) -> String {
+    format!("{RESTORED}{:.3}s", silent.as_secs_f64())
+}
+
 #[derive(Default)]
 struct RecoveryBudget {
     retries: usize,
@@ -995,6 +1011,8 @@ fn bridge(target: Target, prefix: String, executable: PinnedSessionExecutable) -
     let mut offset = 0;
     let mut recovery = RecoveryBudget::default();
     let mut create = true;
+    // Last time the machine was heard before the transport dropped.
+    let mut silent_since: Option<Instant> = None;
     loop {
         let mode = if create { "create" } else { "attach" };
         // Creation is one-shot even when its response is lost. All later
@@ -1068,6 +1086,9 @@ fn bridge(target: Target, prefix: String, executable: PinnedSessionExecutable) -
             };
             connected.store(true, Ordering::SeqCst);
             *last_seen.lock().unwrap() = Instant::now();
+            if let Some(since) = silent_since.take() {
+                eprintln!("{}", restored_line(since.elapsed()));
+            }
             let (lock, cv) = &*pending;
             acknowledge(&mut lock.lock().unwrap(), accepted)?;
             cv.notify_all();
@@ -1166,8 +1187,11 @@ fn bridge(target: Target, prefix: String, executable: PinnedSessionExecutable) -
         match result {
             Ok(_) => return Ok(()),
             Err(e) if recovery.retry(&e, Instant::now()) => {
+                // A failed reattach attempt keeps the first loss's time.
+                let heard = *last_seen.lock().unwrap();
+                silent_since.get_or_insert(heard);
                 eprintln!(
-                    "hosted: transport interrupted, reattaching original session ({}/{RECONNECTS})",
+                    "{INTERRUPTED}, reattaching original session ({}/{RECONNECTS})",
                     recovery.retries
                 );
             }

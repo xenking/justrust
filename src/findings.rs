@@ -83,6 +83,17 @@ pub fn e2e_findings(s: &Summary) -> Vec<Finding> {
             ),
         ));
     }
+    let outage = seg("remote.link_outage");
+    if notable(outage) {
+        out.push(Finding::new(
+            "link_outage",
+            outage,
+            format!(
+                "{outage:.1}s with the connection to the build machine down. The build kept running \
+                 there and the session reattached: the network between this machine and it dropped"
+            ),
+        ));
+    }
     let artifacts = seg("remote.artifacts");
     if notable(artifacts) {
         out.push(Finding::new(
@@ -100,6 +111,18 @@ pub fn e2e_findings(s: &Summary) -> Vec<Finding> {
             "remote_admission",
             admission,
             format!("{admission:.1}s waiting for the hosted build service to admit the run"),
+        ));
+    }
+    let toolchain = seg("host.toolchain") + seg("client.toolchain");
+    if notable(toolchain) {
+        out.push(Finding::new(
+            "toolchain_wait",
+            toolchain,
+            format!(
+                "{toolchain:.1}s before cargo started, selecting the compiler: the build machine was \
+                 installing or switching a toolchain (every build there waits for that), or this \
+                 run installed its pinned one. Once per toolchain change"
+            ),
         ));
     }
     out
@@ -469,6 +492,8 @@ pub fn analyze(s: &Summary) -> Vec<Finding> {
     }
 
     out.extend(giant_crates(s));
+    out.extend(memory_wait(s));
+    out.extend(balloon_wait(s));
 
     // Build gaps: no rustc running inside the build window.
     if p.build_gaps >= 1.0 {
@@ -539,6 +564,69 @@ pub fn analyze(s: &Summary) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Compilers held back for memory on a build host (`memgov.rs`). The shim
+/// charges that time to its `wait-memory` stage, outside every unit's wall,
+/// so it would otherwise read as compile time or an unexplained gap.
+fn memory_wait(s: &Summary) -> Option<Finding> {
+    let stages = &s.gaps.as_ref()?.shim_stages;
+    let secs = |name: &str| -> f64 {
+        stages
+            .iter()
+            .filter(|x| x.name == name)
+            .map(|x| x.secs)
+            .sum()
+    };
+    let (waited, gave_up) = (secs("wait-memory"), secs("wait-memory-timeout"));
+    let total = waited + gave_up;
+    if total < 1.0 {
+        return None;
+    }
+    // Job-slot seconds: jobs that waited side by side cost the wall once.
+    let window = s.phases.compile + s.phases.build_gaps;
+    let cost = (total / s.resources.avg_build_cores.max(1.0)).min(window);
+    let free = s.resources.min_mem_available_mb;
+    let gave_up = if gave_up > 0.0 {
+        format!("; {gave_up:.1}s of it ended at the wait limit and the compiler ran anyway")
+    } else {
+        String::new()
+    };
+    Some(Finding::new(
+        "memory_wait",
+        cost,
+        format!(
+            "compilers waited {total:.1}s of job time for memory before starting \
+             (lowest free memory {:.1} GB, other builds on this machine share it){gave_up}",
+            free as f64 / 1024.0
+        ),
+    ))
+}
+
+/// Compilers held back while the hosted slot's memory balloon deflated: an
+/// idle slot is shrunk to about 6 GiB and the host returns the rest once it
+/// sees work. Its own cause and its own fix (deflate before the first
+/// compiler), so it is not folded into `memory_wait`.
+fn balloon_wait(s: &Summary) -> Option<Finding> {
+    let total: f64 = (s.gaps.as_ref()?.shim_stages.iter())
+        .filter(|x| x.name == "wait-balloon")
+        .map(|x| x.secs)
+        .sum();
+    if total < 1.0 {
+        return None;
+    }
+    let window = s.phases.compile + s.phases.build_gaps;
+    let cost = (total / s.resources.avg_build_cores.max(1.0)).min(window);
+    Some(Finding::new(
+        "balloon_wait",
+        cost,
+        format!(
+            "compilers waited {total:.1}s of job time for this machine's memory to come back: \
+             it was idle, so the host had taken all but {:.1} GB of it and returned it only \
+             after the build started. A hosted-service cost, nothing in this project causes it",
+            s.resources.min_mem_available_mb as f64 / 1024.0
+        ),
+    ))
 }
 
 /// Crates at least this big (lines under `src/`) are flagged as split candidates.
@@ -680,6 +768,9 @@ fn generalize_reason(r: &str) -> String {
     if r.contains("has changed") && r.starts_with("the file") {
         return "source file changed".into();
     }
+    if let Some(short) = crate::summary::unfinished_build_reason(r) {
+        return short.into();
+    }
     if r.contains("RUSTFLAGS") || r.contains("rustflags") {
         return "RUSTFLAGS changed".into();
     }
@@ -705,7 +796,7 @@ fn unit_matches(unit_name: &str, package: &str) -> bool {
 }
 
 /// Cargo flags that take a value, so the next arg is not a test filter.
-const VALUE_FLAGS: &[&str] = &[
+pub(crate) const VALUE_FLAGS: &[&str] = &[
     "-p",
     "--package",
     "-F",
@@ -857,6 +948,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_wait_for_memory_is_its_own_finding() {
+        let stage = |name: &str, secs: f64| crate::shim::ShimStage {
+            name: name.into(),
+            secs,
+        };
+        let mut s = base();
+        s.phases.compile = 18.0;
+        s.resources.avg_build_cores = 8.0;
+        s.resources.min_mem_available_mb = 3072;
+        s.gaps = Some(crate::gaps::Gaps {
+            shim_stages: vec![stage("key", 9.0), stage("wait-memory", 0.4)],
+            ..Default::default()
+        });
+        assert!(memory_wait(&s).is_none(), "under a second is not reported");
+        s.gaps = Some(crate::gaps::Gaps {
+            shim_stages: vec![
+                stage("key", 9.0),
+                stage("wait-memory", 30.0),
+                stage("wait-memory-timeout", 10.0),
+            ],
+            ..Default::default()
+        });
+        let f = memory_wait(&s).unwrap();
+        assert_eq!(f.kind, "memory_wait");
+        assert_eq!(f.cost_secs, 5.0, "40s of job time over 8 busy cores");
+        assert!(f.message.contains("waited 40.0s of job time for memory"));
+        assert!(f.message.contains("lowest free memory 3.0 GB"));
+        assert!(f.message.contains("10.0s of it ended at the wait limit"));
+        assert!(analyze(&s).iter().any(|f| f.kind == "memory_wait"));
+        // A deflating balloon is reported apart from it.
+        assert!(balloon_wait(&s).is_none());
+        s.gaps = Some(crate::gaps::Gaps {
+            shim_stages: vec![stage("wait-memory", 0.2), stage("wait-balloon", 24.0)],
+            ..Default::default()
+        });
+        assert!(memory_wait(&s).is_none());
+        let f = balloon_wait(&s).unwrap();
+        assert_eq!((f.kind.as_str(), f.cost_secs), ("balloon_wait", 3.0));
+        assert!(f.message.contains("waited 24.0s of job time"));
+        assert!(f.message.contains("all but 3.0 GB"));
+        assert!(analyze(&s).iter().any(|f| f.kind == "balloon_wait"));
+    }
+
     fn with_e2e(segs: &[(&str, f64)], derived: bool) -> Summary {
         let mut s = base();
         s.e2e = Some(crate::e2e::E2e {
@@ -870,6 +1005,8 @@ mod tests {
                 .collect(),
             trace: vec![],
             derived,
+            parts: vec![],
+            artifact_times: None,
         });
         s
     }

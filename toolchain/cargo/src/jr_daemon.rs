@@ -61,6 +61,14 @@ const IDLE: Duration = Duration::from_secs(15 * 60);
 const TICK: Duration = Duration::from_secs(20);
 const MAX_PARKED: usize = 6;
 const MEM_FLOOR_KB: u64 = 2 * 1024 * 1024;
+/// [`sweep`] leaves files younger than this alone: a server that is still
+/// starting has logs and a start marker but no pid file yet.
+const SWEEP_GRACE: Duration = Duration::from_secs(120);
+/// A socket without a pid file (a server from before pid files) is dead once
+/// it is this old: a live server touches its socket per request and exits
+/// after [`IDLE`].
+const SWEEP_UNOWNED_SOCK: Duration = Duration::from_secs(60 * 60);
+const SWEEP_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Variables that identify the caller (agent, terminal, justrust run), not
 /// the build. Excluded from the key; the child still gets the client's
@@ -131,6 +139,23 @@ pub fn is_child() -> bool {
     CHILD_CONN.load(Ordering::Relaxed) >= 0
 }
 
+/// A server that is still starting is about to do `what`, which a user
+/// would see or wait for (a network update, a rewritten `Cargo.lock`). That
+/// belongs to the user's own next command, with its messages: the server
+/// exits instead. A no-op in every other process, including a server's
+/// forked child, which is a user's command.
+pub fn server_must_not(what: &str) {
+    let Some((sock, _)) = SERVING.get() else {
+        return;
+    };
+    if is_child() || PARKED.load(Ordering::SeqCst) {
+        return;
+    }
+    eprintln!("jr-cargo daemon: not parking: a server does not {what}");
+    let _ = std::fs::remove_file(starting_marker(sock));
+    std::process::exit(0);
+}
+
 /// Start of the client's request, for "Finished in" and timings.
 pub fn child_start() -> Option<Instant> {
     CHILD_START.get().copied()
@@ -157,6 +182,11 @@ fn subcommand(args: &[OsString]) -> Option<&str> {
         return Some(a);
     }
     None
+}
+
+/// Whether fork servers may be running for this user's builds.
+pub fn enabled() -> bool {
+    !std::env::var_os(ENABLE_ENV).is_some_and(|v| v == "0")
 }
 
 /// The socket for this invocation, if it may use the daemon.
@@ -260,6 +290,81 @@ fn request(sock: &Path) -> io::Result<Reply> {
 
 fn nopark_marker(sock: &Path) -> PathBuf {
     sock.with_extension("nopark")
+}
+
+/// Pids holding an flock on the file with inode `ino`, from the text of
+/// `/proc/locks` (`1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF`; lines
+/// with `->` are waiters, not holders).
+fn flock_holders(locks: &str, ino: u64) -> Vec<i32> {
+    let mut pids = Vec::new();
+    for line in locks.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 6 || f[1] != "FLOCK" {
+            continue;
+        }
+        let holds = f[5].rsplit(':').next().and_then(|i| i.parse().ok()) == Some(ino);
+        if let (true, Ok(pid)) = (holds, f[4].parse::<i32>()) {
+            if pid > 0 && !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+/// A cargo blocked on the lock file `path`. Kills every holder that is a
+/// jr-cargo server (it has `JUSTRUST_CARGO_SERVE` in its environment; a
+/// parked server holds no cache lock, so a holder is one still starting)
+/// and waits for the kernel to release its locks. Returns whether any was
+/// stopped. A server killed here did no build and is respawned by the next
+/// client that falls back; cargo's cache tolerates a killed cargo.
+pub fn stop_starting_servers_holding(path: &Path) -> bool {
+    if SERVING.get().is_some() || is_child() {
+        return false;
+    }
+    let (Ok(meta), Ok(locks)) = (
+        std::fs::metadata(path),
+        std::fs::read_to_string("/proc/locks"),
+    ) else {
+        return false;
+    };
+    let serve = format!("{SERVE_ENV}=");
+    let trace = std::env::var_os("JUSTRUST_CARGO_DAEMON_TRACE").is_some();
+    let mut stopped = false;
+    for pid in flock_holders(&locks, meta.ino()) {
+        let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
+            if trace {
+                eprintln!("jr-cargo daemon: holder {pid}: environment unreadable");
+            }
+            continue;
+        };
+        if trace {
+            let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            eprintln!(
+                "jr-cargo daemon: {} is held by pid {pid}: {}",
+                path.display(),
+                String::from_utf8_lossy(&cmd).replace('\0', " ")
+            );
+        }
+        let Some(sock) = env
+            .split(|b| *b == 0)
+            .find_map(|v| v.strip_prefix(serve.as_bytes()))
+        else {
+            continue;
+        };
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            continue;
+        }
+        stopped = true;
+        // Its start attempt is over: let the next client spawn a new one.
+        let sock = PathBuf::from(std::ffi::OsString::from_vec(sock.to_vec()));
+        let _ = std::fs::remove_file(starting_marker(&sock));
+        let gone = Instant::now() + Duration::from_millis(500);
+        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    stopped
 }
 
 fn starting_marker(sock: &Path) -> PathBuf {
@@ -476,6 +581,8 @@ pub fn park(bcx: &BuildContext<'_, '_>, has_logger: bool) {
         }
     };
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    let _ = std::fs::write(sock.with_extension("pid"), std::process::id().to_string());
+    sweep(sock);
     eprintln!("jr-cargo daemon: parked at {}", sock.display());
     loop {
         let mut pfd = libc::pollfd {
@@ -549,7 +656,12 @@ fn mem_available_kb() -> Option<u64> {
 
 /// Why this parked server should exit now, if at all.
 fn evict_reason(sock: &Path) -> Option<&'static str> {
-    let mine = std::fs::symlink_metadata(sock).ok()?.modified().ok()?;
+    // Unreachable without its socket (removed by hand, or a wiped runtime
+    // directory): nothing could ever evict this server otherwise.
+    let Ok(meta) = std::fs::symlink_metadata(sock) else {
+        return Some("socket removed");
+    };
+    let mine = meta.modified().ok()?;
     if mine.elapsed().unwrap_or_default() >= IDLE {
         return Some("idle");
     }
@@ -569,7 +681,77 @@ fn evict_reason(sock: &Path) -> Option<&'static str> {
 fn shutdown(sock: &Path, why: &str) -> ! {
     eprintln!("jr-cargo daemon: exiting ({why})");
     let _ = std::fs::remove_file(sock);
+    for ext in ["pid", "out", "err"] {
+        let _ = std::fs::remove_file(sock.with_extension(ext));
+    }
+    sweep(sock);
     std::process::exit(0)
+}
+
+/// Whether the server that wrote `<stem>.pid` is still running. `None`: no
+/// readable pid file.
+fn owner_alive(any_file_of_key: &Path) -> Option<bool> {
+    let pid: i32 = std::fs::read_to_string(any_file_of_key.with_extension("pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if pid <= 0 {
+        return Some(false);
+    }
+    let r = unsafe { libc::kill(pid, 0) };
+    Some(r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Whether [`sweep`] may delete a file with extension `ext` that was last
+/// modified `age` ago and whose server is `owner` (see [`owner_alive`]).
+fn sweepable(ext: &str, age: Duration, owner: Option<bool>) -> bool {
+    if owner == Some(true) || age < SWEEP_GRACE {
+        return false;
+    }
+    match ext {
+        // A "this invocation cannot park" memo outlives its server on purpose.
+        "nopark" => age >= SWEEP_DAY,
+        "sock" if owner.is_none() => age >= SWEEP_UNOWNED_SOCK,
+        "sock" | "out" | "err" | "pid" | "starting" => true,
+        _ => false,
+    }
+}
+
+/// Removes what dead servers left in the runtime directory: sockets of
+/// killed servers and the logs of every server that exited without parking.
+/// Runs when a server parks and when it exits, never in a client.
+fn sweep(own: &Path) {
+    let Some(dir) = own.parent() else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.file_stem() == own.file_stem() {
+            continue;
+        }
+        let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        // `DirEntry::metadata` does not follow symlinks.
+        let Some(age) = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+        else {
+            continue;
+        };
+        if age < SWEEP_GRACE {
+            continue;
+        }
+        if sweepable(ext, age, owner_alive(&p)) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 fn bind(sock: &Path) -> io::Result<UnixListener> {
@@ -748,10 +930,138 @@ mod tests {
     }
 
     #[test]
+    fn flock_holders_reads_proc_locks() {
+        let locks = "1: FLOCK  ADVISORY  WRITE 4242 fd:01:777 0 EOF\n\
+                     1: -> FLOCK  ADVISORY  WRITE 4300 fd:01:777 0 EOF\n\
+                     2: POSIX  ADVISORY  WRITE 4400 fd:01:777 0 EOF\n\
+                     3: FLOCK  ADVISORY  READ 4500 fd:01:778 0 EOF\n\
+                     4: FLOCK  ADVISORY  READ 4600 fd:01:777 0 EOF\n";
+        assert_eq!(flock_holders(locks, 777), vec![4242, 4600]);
+        assert_eq!(flock_holders(locks, 778), vec![4500]);
+        assert!(flock_holders(locks, 1).is_empty());
+    }
+
+    /// A process that holds the lock and carries the server variable is
+    /// stopped and its start marker removed. One without the variable (any
+    /// other cargo) is left alone.
+    #[test]
+    fn stops_only_servers_holding_the_lock() {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".package-cache");
+        let sock = dir.path().join("k.sock");
+        std::fs::write(starting_marker(&sock), b"").unwrap();
+        let hold = |server: bool| {
+            let mut cmd = Command::new("flock");
+            cmd.arg("-o").arg(&lock).args(["sleep", "20"]);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .env_remove(SERVE_ENV);
+            if server {
+                cmd.env(SERVE_ENV, &sock);
+            }
+            cmd.spawn().ok()
+        };
+        let held = |pid: u32| {
+            let ino = std::fs::metadata(&lock).map(|m| m.ino()).unwrap_or(0);
+            let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+            flock_holders(&locks, ino).contains(&(pid as i32))
+        };
+        let wait_held = |pid: u32| {
+            let end = Instant::now() + Duration::from_secs(10);
+            while !held(pid) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            held(pid)
+        };
+        // No flock(1) on this machine: nothing to test with.
+        let Some(mut other) = hold(false) else {
+            return;
+        };
+        assert!(wait_held(other.id()));
+        assert!(!stop_starting_servers_holding(&lock));
+        assert!(held(other.id()));
+        other.kill().unwrap();
+        other.wait().unwrap();
+
+        let mut server = hold(true).unwrap();
+        assert!(wait_held(server.id()));
+        assert!(stop_starting_servers_holding(&lock));
+        server.wait().unwrap();
+        assert!(!held(server.id()));
+        assert!(!starting_marker(&sock).exists());
+    }
+
+    #[test]
     fn volatile_vars() {
         assert!(volatile("JUSTRUST_RUN_DIR"));
         assert!(volatile("KITTY_WINDOW_ID"));
         assert!(!volatile("RUSTFLAGS"));
         assert!(!volatile("CARGO_TARGET_DIR"));
+    }
+
+    #[test]
+    fn sweep_rules() {
+        let s = Duration::from_secs;
+        // A live server keeps everything, however old.
+        assert!(!sweepable("sock", SWEEP_DAY * 3, Some(true)));
+        assert!(!sweepable("err", SWEEP_DAY * 3, Some(true)));
+        // A starting server has fresh logs and no pid file yet.
+        assert!(!sweepable("out", s(5), None));
+        assert!(!sweepable("starting", s(5), None));
+        // Dead owner: logs, pid file and socket go after the grace period.
+        assert!(sweepable("sock", s(300), Some(false)));
+        assert!(sweepable("pid", s(300), Some(false)));
+        assert!(sweepable("err", s(300), None));
+        // A socket without a pid file may belong to an older live server.
+        assert!(!sweepable("sock", s(300), None));
+        assert!(sweepable("sock", SWEEP_UNOWNED_SOCK, None));
+        assert!(!sweepable("nopark", s(300), Some(false)));
+        assert!(sweepable("nopark", SWEEP_DAY, None));
+        assert!(!sweepable("toml", SWEEP_DAY, None));
+    }
+
+    #[test]
+    fn sweep_removes_only_dead_servers_files() {
+        let dir = std::env::temp_dir().join(format!("jr-daemon-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(600);
+        let mk = |name: &str, body: &str, old_file: bool| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            if old_file {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&p)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            p
+        };
+        let me = std::process::id().to_string();
+        // Live server (this process), old files: kept.
+        let live = [mk("aa.pid", &me, true), mk("aa.err", "x", true)];
+        // Dead server (no such pid), old files: removed.
+        let dead = [
+            mk("bb.pid", "0", true),
+            mk("bb.err", "x", true),
+            mk("bb.out", "", true),
+        ];
+        // No pid file: old logs removed, fresh ones (a server starting) kept.
+        let orphan_log = mk("cc.err", "x", true);
+        let starting = [mk("dd.err", "", false), mk("dd.starting", "", false)];
+        // The sweeping server's own files are never touched.
+        let own = mk("ee.err", "x", true);
+        sweep(&dir.join("ee.sock"));
+        for p in live.iter().chain(&starting).chain([&own]) {
+            assert!(p.exists(), "{} should be kept", p.display());
+        }
+        for p in dead.iter().chain([&orphan_log]) {
+            assert!(!p.exists(), "{} should be removed", p.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

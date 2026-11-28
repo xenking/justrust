@@ -1,6 +1,6 @@
 [package]
 name = "justrust"
-version = "0.1.58"
+version = "0.1.78"
 edition = "2024"
 rust-version = "1.91"
 readme = "README.md"
@@ -57,6 +57,11 @@ debug = "line-tables-only"
 # Large artifact round trips otherwise spend their test time in debug DEFLATE.
 # Keep the client itself unoptimized for fast edit/build loops. Release is unchanged.
 [profile.dev.package.miniz_oxide]
+opt-level = 3
+
+# A debug client hashes its own 174 MB executable to name its build: 1.33 s
+# unoptimized, once per new binary now that the digest is remembered.
+[profile.dev.package.sha2]
 opt-level = 3
 
 [target.'cfg(windows)'.dependencies]

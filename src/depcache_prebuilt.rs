@@ -81,6 +81,73 @@ pub(crate) fn note_success(root: &Path) {
 /// on a quiet laptop, fetching selectively 19-26 s vs 34-35 s (FINDINGS 43).
 pub const DEFAULT_STORE: &str = "https://d1j555vqgf2xkj.cloudfront.net";
 
+/// The bucket behind [`DEFAULT_STORE`] (us-east-1, `StoreUrl` of
+/// justrust-cloud `infra/prebuilt-store.yaml`): the same public, read-only
+/// objects without the CDN. A machine that keeps connections open (the
+/// remote agent's proxy) reads a key the CDN edge does not hold faster from
+/// here, because the edge has to come here first: 0.10 s against 0.27 s per
+/// manifest from a us-west-2 build host.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub const DEFAULT_STORE_ORIGIN: &str =
+    "https://jcode-justrust-prebuilt-production-280196252242.s3.us-east-1.amazonaws.com";
+
+/// Read replicas of that bucket in other regions (justrust-cloud
+/// `infra/prebuilt-store-replica.yaml`), filled by S3 replication, so they
+/// can lag it: a key missing in one is asked for again from the store. From
+/// a build host in the same region a request takes about 4 ms.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub const DEFAULT_STORE_REPLICAS: &[&str] = &[
+    "https://jcode-justrust-prebuilt-production-280196252242-us-west-2.s3.us-west-2.amazonaws.com",
+];
+
+/// Every place the remote agent's proxy can read the store at `base` from,
+/// which it ranks by measured latency (`prebuilt_proxy`). The public store
+/// adds its bucket and replicas. `JUSTRUST_PREBUILT_REPLICAS` (https URLs
+/// separated by spaces or commas) names replicas of any store.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn proxy_sources(base: &str) -> Vec<crate::prebuilt_proxy::Source> {
+    proxy_sources_with(
+        base,
+        std::env::var("JUSTRUST_PREBUILT_REPLICAS").ok().as_deref(),
+    )
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn proxy_sources_with(base: &str, replicas: Option<&str>) -> Vec<crate::prebuilt_proxy::Source> {
+    use crate::prebuilt_proxy::Source;
+    let base = base.trim_end_matches('/');
+    let mut v = vec![Source {
+        base: base.to_owned(),
+        authoritative: true,
+    }];
+    let replica = |url: &str, v: &mut Vec<Source>| {
+        let url = url.trim().trim_end_matches('/');
+        if url.starts_with("https://") && v.iter().all(|s| s.base != url) {
+            v.push(Source {
+                base: url.to_owned(),
+                authoritative: false,
+            });
+        }
+    };
+    if base == DEFAULT_STORE {
+        v.push(Source {
+            base: DEFAULT_STORE_ORIGIN.to_owned(),
+            authoritative: true,
+        });
+        for r in DEFAULT_STORE_REPLICAS {
+            replica(r, &mut v);
+        }
+    }
+    for r in replicas
+        .unwrap_or_default()
+        .split([' ', ',', '\n', '\t'])
+        .filter(|r| !r.is_empty())
+    {
+        replica(r, &mut v);
+    }
+    v
+}
+
 /// The toolchain the public store is compiled with (justrust-cloud
 /// `prebuild/run.sh` default). Keys include rustc `-vV`, so only builds
 /// with a toolchain the fleet compiles for can hit the store. Remote build
@@ -287,11 +354,70 @@ pub(crate) fn tmp(root: &Path, tag: &str) -> PathBuf {
     ))
 }
 
-/// Local copy of the store's index, one hash of the base URL per store.
+/// Names the store behind `JUSTRUST_PREBUILT` when that is a loopback proxy
+/// (`http://127.0.0.1:<port>`, what the remote agent gives its builds).
+pub(crate) const STORE_ENV: &str = "JUSTRUST_PREBUILT_STORE";
+
+/// Local copy of the store's index, one hash of the store's URL per store.
+///
+/// Behind the agent's proxy the base URL is `http://127.0.0.1:<port>` with a
+/// port the kernel picked for that agent, so naming the file after the base
+/// gave every session its own index of the same store: its first build
+/// fetched it again, and the old files were never read again. The agent
+/// names the store it proxies in [`STORE_ENV`], and the file is named after
+/// that. One index covers every toolchain (the keys in it differ), so the
+/// toolchain is not part of the name. A different store is a different name.
 fn index_path(root: &Path, base: &str) -> PathBuf {
+    index_path_for(root, base, std::env::var(STORE_ENV).ok().as_deref())
+}
+
+fn index_path_for(root: &Path, base: &str, store: Option<&str>) -> PathBuf {
     let mut h = depcache::H128::new();
-    h.field(base.as_bytes());
+    h.field(index_identity(base, store).as_bytes());
     root.join(format!("prebuilt-index-{}", &h.hex()[..12]))
+}
+
+/// Remove other stores' index copies nobody has refreshed for a day.
+///
+/// An index is used for [`INDEX_SECS`] and then fetched again, so one this
+/// old is only disk: a build host had 50 of them (206 MB), one per agent
+/// session, from when they were named after the proxy's port. Runs after a
+/// refresh, so at most once per [`INDEX_SECS`] per store. Lock files (empty)
+/// stay: a lock must keep its inode while anyone may hold it.
+fn sweep_old_indexes(root: &Path, keep: &Path) {
+    const OLD_SECS: f64 = 24.0 * 3600.0;
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = e.file_name();
+        let Some(hex) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("prebuilt-index-"))
+        else {
+            continue;
+        };
+        let is_index = hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_index && p != keep && !fresh_file(&p, OLD_SECS) {
+            let _ = std::fs::remove_file(&p);
+            let _ = std::fs::remove_file(p.with_extension("costs"));
+            let _ = std::fs::remove_file(p.with_extension("none"));
+        }
+    }
+}
+
+/// What an index file is named after: the proxied store for a loopback base
+/// that names one, else the base itself. A store name next to a real store
+/// URL is ignored, so it cannot point one store's lookups at another's index.
+fn index_identity<'a>(base: &'a str, store: Option<&'a str>) -> &'a str {
+    let loopback = ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"]
+        .iter()
+        .any(|p| base.starts_with(p));
+    match store.map(|s| s.trim().trim_end_matches('/')) {
+        Some(s) if loopback && !s.is_empty() => s,
+        _ => base,
+    }
 }
 
 /// Whether downloading the unit should beat compiling it here, from the
@@ -457,9 +583,12 @@ fn may_have(root: &Path, base: &str, key: &str) -> bool {
         else {
             return true;
         };
-        if lock.try_lock().is_err() || fresh_file(&none, INDEX_SECS) {
-            // Busy or unsupported locking: a stale negative could hide a new
-            // key. Probe the manifest normally, including all validation.
+        if lock.try_lock().is_err() && !wait_for_refresh(&lock, &idx, &none) {
+            // Still busy or unsupported locking: a stale negative could hide
+            // a new key. Probe the manifest normally, including all validation.
+            return true;
+        }
+        if fresh_file(&none, INDEX_SECS) {
             return true;
         }
         if fresh_file(&idx, INDEX_SECS) {
@@ -472,6 +601,7 @@ fn may_have(root: &Path, base: &str, key: &str) -> bool {
                     let _ = std::fs::remove_file(&t);
                     return true;
                 }
+                sweep_old_indexes(root, &idx);
             }
             Got::Missing => {
                 let _ = std::fs::write(&none, b"");
@@ -485,6 +615,29 @@ fn may_have(root: &Path, base: &str, key: &str) -> bool {
         }
     }
     index_file_contains(&idx, key).unwrap_or(true)
+}
+
+/// How long a shim waits for another shim's index refresh before it probes
+/// the store itself. One upstream manifest probe costs about this much.
+const REFRESH_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Another shim is refreshing the index: wait briefly for it instead of
+/// asking the store about this key. A build starts one shim per job at once
+/// and all of them find the index stale. Only one can refresh it, and the
+/// rest each paid an upstream manifest request (measured on a build host:
+/// 0.75s for each of the first 13 units, 9.4s of job time, while the index
+/// itself arrived from the loopback proxy in 2ms). Returns true holding the
+/// lock, or with a fresh index or a fresh no-index marker in place. The
+/// answer still comes from a fresh index only.
+fn wait_for_refresh(lock: &std::fs::File, idx: &Path, none: &Path) -> bool {
+    let t = std::time::Instant::now();
+    while t.elapsed() < REFRESH_WAIT {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if fresh_file(idx, INDEX_SECS) || fresh_file(none, INDEX_SECS) || lock.try_lock().is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 fn index_file_contains(path: &Path, key: &str) -> std::io::Result<bool> {
@@ -834,6 +987,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proxy_reads_the_public_store_from_its_bucket_and_replicas() {
+        let v = proxy_sources_with(DEFAULT_STORE, None);
+        assert_eq!(v[0].base, DEFAULT_STORE);
+        assert_eq!(v[1].base, DEFAULT_STORE_ORIGIN);
+        assert!(v[0].authoritative && v[1].authoritative);
+        assert_eq!(v.len(), 2 + DEFAULT_STORE_REPLICAS.len());
+        // A replica can lag: its "missing" is never final.
+        assert!(v[2..].iter().all(|s| !s.authoritative));
+        for s in &v {
+            assert!(s.base.starts_with("https://") && !s.base.ends_with('/'));
+        }
+
+        // A private store is read from where the user said, plus replicas
+        // they name. Nothing of the public store is mixed in.
+        let v = proxy_sources_with(
+            "https://store.example/",
+            Some("https://r1.example/, http://plain.example https://r1.example https://r2.example"),
+        );
+        let bases: Vec<&str> = v.iter().map(|s| s.base.as_str()).collect();
+        assert_eq!(
+            bases,
+            [
+                "https://store.example",
+                "https://r1.example",
+                "https://r2.example"
+            ]
+        );
+        assert!(v[0].authoritative && !v[1].authoritative && !v[2].authoritative);
+    }
+
+    #[test]
+    fn index_file_is_named_after_the_store_not_the_proxy_port() {
+        let root = Path::new("/r");
+        let store = "https://prebuilt.example";
+        let a = index_path_for(root, "http://127.0.0.1:40001", Some(store));
+        // Another session: another port, the same store, the same file.
+        assert_eq!(
+            a,
+            index_path_for(
+                root,
+                "http://127.0.0.1:51877",
+                Some("https://prebuilt.example/")
+            )
+        );
+        // And the file a direct client of that store uses.
+        assert_eq!(a, index_path_for(root, store, None));
+        // Another store behind the same port is another file.
+        assert_ne!(
+            a,
+            index_path_for(
+                root,
+                "http://127.0.0.1:40001",
+                Some("https://other.example")
+            )
+        );
+        // A proxy that names no store keeps its own file, as before.
+        let unnamed = index_path_for(root, "http://127.0.0.1:40001", None);
+        assert_ne!(a, unnamed);
+        assert_eq!(
+            unnamed,
+            index_path_for(root, "http://127.0.0.1:40001", Some(" "))
+        );
+        // A real store URL is never renamed by the variable.
+        assert_eq!(
+            index_path_for(root, "https://other.example", Some(store)),
+            index_path_for(root, "https://other.example", None)
+        );
+        assert_eq!(
+            index_path_for(root, "file:///srv/store", Some(store)),
+            index_path_for(root, "file:///srv/store", None)
+        );
+        // Costs, the no-index marker and the refresh lock follow the index.
+        assert_eq!(
+            costs_path(root, store),
+            index_path_for(root, store, None).with_extension("costs")
+        );
+    }
+
+    #[test]
+    fn only_day_old_copies_of_other_indexes_are_swept() {
+        let root = std::env::temp_dir().join(format!("jr-idx-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let age = |name: &str, secs: u64| {
+            let p = root.join(name);
+            std::fs::write(&p, b"k\n").unwrap();
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+                .unwrap();
+            p
+        };
+        let day = 24 * 3600;
+        let ours = age("prebuilt-index-aaaaaaaaaaaa", 2 * day);
+        let old = age("prebuilt-index-bbbbbbbbbbbb", 2 * day);
+        let old_costs = age("prebuilt-index-bbbbbbbbbbbb.costs", 2 * day);
+        let old_lock = age("prebuilt-index-bbbbbbbbbbbb.refresh-lock", 2 * day);
+        let recent = age("prebuilt-index-cccccccccccc", day / 2);
+        let other = age("prebuilt-index-notanindex", 2 * day);
+        sweep_old_indexes(&root, &ours);
+        assert!(ours.exists(), "the index just refreshed");
+        assert!(!old.exists() && !old_costs.exists());
+        assert!(old_lock.exists(), "locks keep their inode");
+        assert!(recent.exists(), "another store in use today");
+        assert!(other.exists(), "not a file this module named");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn index_lookup_sorted_and_fallback() {
         let keys = ["0".repeat(32), "5".repeat(32), "a".repeat(32)];
         let b = keys.iter().map(|k| format!("{k}\n")).collect::<String>();
@@ -929,6 +1190,7 @@ mod tests {
                 norm: Norm::new(out_dir.parent().unwrap()).unwrap(),
                 root: dir.join(cache),
                 extra_args: Vec::new(),
+                unkeyed_env: Vec::new(),
             }
         };
         // Publisher: a compile stored in its own cache, then published.

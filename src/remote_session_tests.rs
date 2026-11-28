@@ -9,6 +9,27 @@ fn pinned_executable() -> PinnedSessionExecutable {
 }
 
 #[test]
+fn restored_line_round_trips_and_rejects_everything_else() {
+    let line = restored_line(Duration::from_millis(12_345));
+    assert_eq!(line, "hosted: transport restored after 12.345s");
+    assert_eq!(restored_secs(&line), Some(12.345));
+    assert_eq!(restored_secs(&format!("{line}\r")), Some(12.345));
+    for other in [
+        "hosted: transport interrupted, reattaching original session (1/3)",
+        "hosted: transport restored after -1.000s",
+        "hosted: transport restored after NaNs",
+        "hosted: transport restored after 3.0",
+        "",
+    ] {
+        assert_eq!(restored_secs(other), None, "{other}");
+    }
+    assert!(
+        "hosted: transport interrupted, reattaching original session (1/3)"
+            .starts_with(INTERRUPTED)
+    );
+}
+
+#[test]
 fn pinned_launcher_rejects_changed_executable_path_or_digest_before_connecting() {
     let target = Target {
         dest: "not-contacted".into(),
@@ -243,8 +264,9 @@ impl Fixture {
         prefix: &str,
     ) -> (UnixStream, std::thread::JoinHandle<Result<bool>>) {
         let (mut client, server) = UnixStream::pair().unwrap();
+        // No test waits for this: it only keeps a broken one from hanging.
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(300)))
             .unwrap();
         let broker = self.broker.clone();
         let handle = std::thread::spawn(move || attachment(&broker, server));
@@ -315,8 +337,16 @@ fn transient_disconnect_reattaches_original_job_and_replays_only_missing_output(
     let mut acknowledged = false;
     while delivered.len() < first.len() || !acknowledged {
         match receive(&mut stream).unwrap() {
-            (Packet::Output { offset: 0 }, bytes) => delivered.extend(bytes),
-            (Packet::Ack { seq: 1 }, _) => acknowledged = true,
+            (Packet::Output { offset }, bytes) => {
+                assert_eq!(offset, delivered.len() as u64);
+                delivered.extend(bytes)
+            }
+            // The writer also acknowledges once a second as a pulse, so a
+            // slow start can see the previous count first.
+            (Packet::Ack { seq }, _) => {
+                assert!(seq <= 1, "acknowledged input never sent: {seq}");
+                acknowledged |= seq == 1;
+            }
             other => panic!("unexpected packet: {other:?}"),
         }
     }

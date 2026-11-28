@@ -28,9 +28,10 @@ mod early;
 mod export;
 mod failure;
 mod findings;
+mod gaps;
 mod hints;
 mod history;
-mod hybrid;
+mod incr_gc;
 mod install;
 mod ios_tools;
 mod linker;
@@ -38,12 +39,20 @@ mod live;
 mod localcache;
 mod log_journal;
 mod mcp;
+// The governor exists on build hosts, which are Linux. Elsewhere the shim
+// gets a stub that never waits, so none of it is dead code there.
+#[cfg(target_os = "linux")]
+mod memgov;
+#[cfg(not(target_os = "linux"))]
+#[path = "memgov_stub.rs"]
+mod memgov;
 mod msvc_tools;
-mod native;
 mod nolocal;
 mod paths;
 mod peercache;
 mod platform_config;
+// Runs inside the remote agent, which is Unix only.
+#[cfg_attr(not(unix), allow(dead_code))]
 mod prebuilt_proxy;
 mod procfs;
 mod profile;
@@ -119,6 +128,8 @@ mod summary;
 mod sys;
 mod telemetry;
 mod test_bundle;
+#[cfg(all(test, unix))]
+mod test_fork;
 mod test_pool;
 mod test_runner;
 mod toolchain;
@@ -178,12 +189,6 @@ enum Command {
         #[command(subcommand)]
         command: InteractiveCommand,
     },
-    /// Experimental local Blaze-derived compiler. Cargo remains the default.
-    #[command(disable_help_flag = true)]
-    Native(Passthrough),
-    /// Experimental ready-resident execution with an explicit Cargo fallback.
-    #[command(disable_help_flag = true)]
-    Hybrid(Passthrough),
     /// Pack or execute portable, trusted test executable bundles.
     TestBundle {
         #[command(subcommand)]
@@ -340,6 +345,19 @@ enum Command {
         /// Internal: background GC of the slots under this dir.
         #[arg(long, hide = true)]
         gc_root: Option<PathBuf>,
+    },
+    /// Collect stale incremental compilation state: crate directories no
+    /// build has used for days, or that a newer crate id replaced.
+    IncrGc {
+        /// Incremental directories (`.../incremental`). Default: this
+        /// workspace's target dir and slots, and the hosted shared stores.
+        roots: Vec<PathBuf>,
+        /// Report what would be removed and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Internal: detached run after a build.
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// Show the shared dependency cache: size, entries, hit rate.
     Cache {
@@ -909,9 +927,6 @@ pub fn main() -> anyhow::Result<()> {
     {
         buildscript::main(PathBuf::from(real), rest.collect());
     }
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__hybrid-prewarm")) {
-        return hybrid::background(std::env::args_os().skip(2).collect());
-    }
     // `justrust __test-runner <binary> ...`: cargo's runner during `test`.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(test_runner::SUBCOMMAND))
     {
@@ -979,30 +994,6 @@ pub fn main() -> anyhow::Result<()> {
         let spec = toolchain::Spec::parse(&std::env::args().nth(2).unwrap_or_default())?;
         println!("{}", toolchain::probe_location(&spec)?);
         return Ok(());
-    }
-    // Native is explicit and bypasses Cargo-specific defaults, account polling
-    // and update notices. Preserve argv, particularly the test runner separator.
-    if name != "cargo"
-        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("native"))
-    {
-        return native::main(std::env::args_os().skip(2).collect());
-    }
-    if name != "cargo"
-        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("hybrid"))
-    {
-        return hybrid::main(std::env::args_os().skip(2).collect());
-    }
-    if name != "cargo"
-        && std::env::var_os("JUSTRUST_HYBRID").as_deref() == Some(std::ffi::OsStr::new("ready"))
-        && matches!(
-            std::env::args_os()
-                .nth(1)
-                .as_deref()
-                .and_then(|a| a.to_str()),
-            Some("build" | "test" | "check" | "run")
-        )
-    {
-        return hybrid::main(std::env::args_os().skip(1).collect());
     }
     if std::env::args_os().nth(1).as_deref() != Some(std::ffi::OsStr::new("setup")) {
         platform_config::apply_defaults()?;
@@ -1073,9 +1064,7 @@ pub fn main() -> anyhow::Result<()> {
 /// build commands (recorded as runs) and for `telemetry` itself.
 fn command_name(c: &Command) -> Option<&'static str> {
     Some(match c {
-        Command::Native(_)
-        | Command::Hybrid(_)
-        | Command::Check(_)
+        Command::Check(_)
         | Command::Test(_)
         | Command::Build(_)
         | Command::Zigbuild(_)
@@ -1100,6 +1089,10 @@ fn command_name(c: &Command) -> Option<&'static str> {
             gc_root: Some(_), ..
         } => return None,
         Command::Slots { .. } => "slots",
+        Command::IncrGc {
+            background: true, ..
+        } => return None,
+        Command::IncrGc { .. } => "incr-gc",
         Command::Cache { auto: true, .. } => return None,
         Command::Cache { .. } => "cache",
         Command::Early { .. } => "early",
@@ -1134,8 +1127,6 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Interactive {
             command: InteractiveCommand::Dashboard,
         } => dashboard::run()?,
-        Command::Native(p) => native::main(p.args)?,
-        Command::Hybrid(p) => hybrid::main(p.args)?,
         Command::TestBundle { cmd } => test_bundle::main(cmd),
         Command::Check(p) => agent("check", p.args),
         Command::Test(p) => agent("test", p.args),
@@ -1235,6 +1226,11 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             du,
             gc_root,
         } => slots::command(clean, gc, du, gc_root)?,
+        Command::IncrGc {
+            roots,
+            dry_run,
+            background,
+        } => incr_gc::command(roots, dry_run, background)?,
         Command::Cache {
             prune,
             clear,

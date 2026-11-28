@@ -133,12 +133,97 @@ pub struct Scan {
     pub oversized: Vec<PathBuf>,
 }
 
+/// Directories outside `pkg` holding files that its sources name by a literal
+/// relative path: `#[path = "../x.rs"]`, `include!("../x.rs")` (also `_str`
+/// and `_bytes`), or `concat!(env!("CARGO_MANIFEST_DIR"), "/../x")`.
+///
+/// Cargo metadata names packages, not files, so a mirror of the package
+/// roots alone left such a file behind and the machine failed with
+/// "couldn't find file" on a tree that builds locally. Only literals on one
+/// line are read. Anything else is found from the failed build's error.
+pub fn escaping_source_dirs(pkg: &Path) -> BTreeSet<PathBuf> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![pkg.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                // Build output, VCS data, and nested packages (scanned as
+                // packages of their own when they are part of the build).
+                if name != "target"
+                    && !name.to_string_lossy().starts_with('.')
+                    && !path.join("Cargo.toml").is_file()
+                {
+                    stack.push(path);
+                }
+            } else if kind.is_file()
+                && path.extension().is_some_and(|x| x == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+                && text.contains("../")
+            {
+                let here = path.parent().unwrap_or(pkg);
+                for line in text.lines() {
+                    escaping_literals(pkg, here, line, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn escaping_literals(pkg: &Path, here: &Path, line: &str, out: &mut BTreeSet<PathBuf>) {
+    let code = line.trim_start();
+    if !code.contains("../") || code.starts_with("//") {
+        return;
+    }
+    let manifest = code.contains("CARGO_MANIFEST_DIR");
+    if !(manifest || code.contains("include") || code.contains("#[path")) {
+        return;
+    }
+    // Odd pieces of a split on quotes are the string literals.
+    for literal in code.split('"').skip(1).step_by(2) {
+        if !literal.contains("../") {
+            continue;
+        }
+        let base = if manifest { pkg } else { here };
+        let file = lexical_normalize(&base.join(literal.trim_start_matches('/')));
+        if !file.starts_with(pkg)
+            && file.is_file()
+            && let Some(dir) = file.parent()
+        {
+            out.insert(dir.to_path_buf());
+        }
+    }
+}
+
+/// `a/b/../c` as `a/c`, without touching the filesystem.
+pub fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => (),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Every regular file the build may read under `root`: tracked and untracked
 /// files that are not gitignored (or a plain walk outside git).
 pub fn scan(root: &Path) -> Result<Scan> {
     let mut out = Scan::default();
     let ignore = JustrustIgnore::load(root);
-    let (listed, locks) = discover_source_entries(root);
+    let (listed, locks) = discover_source_entries(root, &ignore);
     let rels: Vec<PathBuf> = match listed {
         Ok(o) if o.status.success() => o
             .stdout
@@ -190,17 +275,23 @@ pub fn scan(root: &Path) -> Result<Scan> {
     Ok(out)
 }
 
-fn discover_source_entries(root: &Path) -> (std::io::Result<std::process::Output>, Vec<PathBuf>) {
+fn discover_source_entries(
+    root: &Path,
+    ignore: &JustrustIgnore,
+) -> (std::io::Result<std::process::Output>, Vec<PathBuf>) {
     // Both queries are fresh and read-only. Neither query depends on the other,
     // and metadata is still observed after both complete. A source tree changing
     // during discovery has never been an atomic snapshot, even when sequential.
+    let excludes = ignore.git_exclude_pathspecs();
     std::thread::scope(|scope| {
         let locks = std::thread::Builder::new().spawn_scoped(scope, || ignored_lockfiles(root));
-        let listed = Command::new("git")
-            .args(["ls-files", "-co", "--exclude-standard", "-z"])
-            .current_dir(root)
-            .stderr(Stdio::null())
-            .output();
+        let mut cmd = Command::new("git");
+        cmd.args(["ls-files", "-co", "--exclude-standard", "-z"]);
+        if !excludes.is_empty() {
+            cmd.args(["--", "."]);
+            cmd.args(&excludes);
+        }
+        let listed = cmd.current_dir(root).stderr(Stdio::null()).output();
         (listed, complete_ignored_lockfiles(root, locks))
     })
 }
@@ -319,8 +410,14 @@ fn skip_listed(root: &Path, rel: &Path) -> bool {
 }
 
 #[derive(Debug, Default)]
-struct JustrustIgnore {
+pub(crate) struct JustrustIgnore {
     rules: Vec<IgnoreRule>,
+}
+
+/// Whether `root`'s `.justrustignore` keeps `rel` (a path under it) out of
+/// its mirror.
+pub fn excluded_from_mirror(root: &Path, rel: &Path) -> bool {
+    JustrustIgnore::load(root).matches(rel)
 }
 
 #[derive(Debug)]
@@ -331,7 +428,7 @@ struct IgnoreRule {
 }
 
 impl JustrustIgnore {
-    fn load(root: &Path) -> Self {
+    pub(crate) fn load(root: &Path) -> Self {
         let Ok(text) = std::fs::read_to_string(root.join(".justrustignore")) else {
             return Self::default();
         };
@@ -363,7 +460,19 @@ impl JustrustIgnore {
         Self { rules }
     }
 
-    fn matches(&self, rel: &Path) -> bool {
+    /// Pathspec excludes for `git ls-files` so ignored trees are not enumerated
+    /// or allocated in Rust during cold/repair/gitignore rescans. Only anchored
+    /// literal rules are forwarded; glob and unanchored rules still run in
+    /// [`Self::matches`].
+    fn git_exclude_pathspecs(&self) -> Vec<String> {
+        self.rules
+            .iter()
+            .filter(|r| r.anchored && !r.pattern.contains(['*', '?', '[', ']']))
+            .map(|r| format!(":(exclude,literal){}", r.pattern))
+            .collect()
+    }
+
+    pub(crate) fn matches(&self, rel: &Path) -> bool {
         if self.rules.is_empty() {
             return false;
         }
@@ -1265,7 +1374,10 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(rsync_supports_secluded_args(executable.as_os_str()));
+        // The probe reports a script that is still busy as unsupported.
+        assert!(crate::test_fork::eventually(|| {
+            rsync_supports_secluded_args(executable.as_os_str())
+        }));
         std::fs::write(
             &executable,
             "#!/bin/sh\nprintf 'rsync version 99.0\\n'\nexit 1\n",
@@ -2369,7 +2481,8 @@ mod tests {
             let serial_locks = ignored_lockfiles(&root);
             serial_times.push(start.elapsed().as_nanos());
             let start = Instant::now();
-            let (parallel_list, parallel_locks) = discover_source_entries(&root);
+            let (parallel_list, parallel_locks) =
+                discover_source_entries(&root, &JustrustIgnore::load(&root));
             let parallel_list = parallel_list.unwrap();
             assert!(parallel_list.status.success());
             parallel_times.push(start.elapsed().as_nanos());
@@ -2651,8 +2764,11 @@ mod tests {
         assert!(m.seed(&wt, &main));
         assert_eq!(std::fs::read_to_string(dst.join("lib.rs")).unwrap(), "seed");
         assert!(!dst.join("target/big").exists());
-        // Never over an existing mirror.
-        std::fs::write(src.join("lib.rs"), "newer").unwrap();
+        // Never over an existing mirror. The seed hard-links unchanged
+        // sources, and sources are replaced (temp file, rename), never
+        // rewritten in place, so a seeded file keeps its content.
+        std::fs::write(src.join("lib.rs.tmp"), "newer").unwrap();
+        std::fs::rename(src.join("lib.rs.tmp"), src.join("lib.rs")).unwrap();
         assert!(!m.seed(&wt, &main));
         assert_eq!(std::fs::read_to_string(dst.join("lib.rs")).unwrap(), "seed");
 
@@ -2721,6 +2837,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // A local "machine" mirrors under a prefix, and a Windows drive path
+    // under a local prefix is not a valid file name there.
+    #[cfg_attr(windows, ignore)]
     #[test]
     fn justrustignore_excludes_tracked_and_untracked_trees_from_scan_and_rsync() {
         let d = std::env::temp_dir().join(format!("jr-ignore-{}", std::process::id()));
@@ -2765,6 +2884,74 @@ mod tests {
         assert!(!remote.join("toolchain/rustc/big.rs").exists());
         assert!(!remote.join("bench/results/out.json").exists());
         assert!(!remote.join("src/scratch.tmp").exists());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn git_ls_files_uses_justrustignore_pathspecs_and_keeps_excluded_root_packages() {
+        let d = std::env::temp_dir().join(format!("jr-git-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let repo = d.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("toolchain/cargo/src")).unwrap();
+        std::fs::create_dir_all(repo.join("bench/results")).unwrap();
+        std::fs::write(
+            repo.join(".justrustignore"),
+            "/toolchain/\n/bench/results/\n*.tmp\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(repo.join("src/scratch.tmp"), "ignored\n").unwrap();
+        std::fs::write(
+            repo.join("toolchain/cargo/Cargo.toml"),
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("toolchain/cargo/src/lib.rs"), "pub fn c() {}\n").unwrap();
+        std::fs::write(repo.join("bench/results/out.json"), "{}\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+
+        let ignore = JustrustIgnore::load(&repo);
+        assert_eq!(
+            ignore.git_exclude_pathspecs(),
+            vec![
+                ":(exclude,literal)toolchain",
+                ":(exclude,literal)bench/results",
+            ]
+        );
+
+        let scanned = scan(&repo).unwrap();
+        assert!(scanned.files.contains_key(Path::new("src/lib.rs")));
+        assert!(
+            !scanned
+                .files
+                .contains_key(Path::new("toolchain/cargo/src/lib.rs"))
+        );
+        assert!(
+            !scanned
+                .files
+                .contains_key(Path::new("bench/results/out.json"))
+        );
+        assert!(!scanned.files.contains_key(Path::new("src/scratch.tmp")));
+
+        // An excluded-root package inside `/toolchain/` has no `.justrustignore`
+        // of its own, so scanning it directly still mirrors all its files.
+        let sub = scan(&repo.join("toolchain/cargo")).unwrap();
+        assert!(sub.files.contains_key(Path::new("Cargo.toml")));
+        assert!(sub.files.contains_key(Path::new("src/lib.rs")));
 
         let _ = std::fs::remove_dir_all(&d);
     }

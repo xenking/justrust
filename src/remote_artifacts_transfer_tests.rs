@@ -1,6 +1,70 @@
 //! Transfer regression tests, separate from platform/format validation fixtures.
 use super::*;
 
+#[cfg(unix)]
+#[test]
+#[ignore = "measures a real executable through a local stream, run alone with --nocapture"]
+fn measure_streamed_executable() {
+    let executable = std::env::current_exe().unwrap();
+    let mut f = Fixture::new("timed-executable", b"placeholder");
+    std::fs::copy(&executable, f.remote.join("app")).unwrap();
+    f.req.have.clear();
+    let (socket, sink) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut input = BufReader::new(socket);
+    let before = |k| crate::e2e::noted(k);
+    let keys = [
+        "artifacts.receive",
+        "artifacts.wire_read",
+        "artifacts.unpack_exposed",
+        "artifacts.verify",
+    ];
+    let initial = keys.map(before);
+    let start = Instant::now();
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| serve_dir(&f.remote, &f.req, &f.sent, sink));
+        let mut measured = None;
+        loop {
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            match serde_json::from_str(&line).unwrap() {
+                Frame::File {
+                    size,
+                    len,
+                    pack_us: Some(pack),
+                    mode,
+                    ..
+                } => {
+                    let output = apply_frame(
+                        &f.root,
+                        "received",
+                        mode,
+                        size,
+                        None,
+                        (&mut input).take(len),
+                        Validation::NativeBuild,
+                    )
+                    .unwrap();
+                    measured = Some((output, size, len, pack));
+                }
+                Frame::End => break,
+                Frame::Hello { .. } => (),
+                frame => panic!("unexpected frame: {frame:?}"),
+            }
+        }
+        sender.join().unwrap().unwrap();
+        let wall = start.elapsed().as_secs_f64();
+        let (output, size, len, pack) = measured.unwrap();
+        let [receive, read, unpack, verify] = std::array::from_fn(|i| before(keys[i]) - initial[i]);
+        assert!((receive - read - unpack).abs() < 1e-8);
+        assert!(pack > 0 && read > 0.0 && unpack > 0.0);
+        assert!(identical_artifact(&output, &executable).unwrap());
+        println!(
+            "artifact loopback: {size} bytes, {len} on wire, {wall:.3}s wall, {:.3}s host pack, {read:.3}s stream reads, {unpack:.3}s exposed unpack, {verify:.3}s verify",
+            pack as f64 / 1e6
+        );
+    });
+}
+
 #[test]
 fn streamed_frame_stops_at_next_header_and_rejects_short_payload_before_install() {
     if !available() {
@@ -91,6 +155,130 @@ fn prediction_reconstructs_exactly_and_rejects_a_changed_base_before_install() {
 }
 
 #[test]
+fn copy_run_recipe_reconstructs_exactly_and_rejects_a_changed_base_before_install() {
+    if !available() {
+        return;
+    }
+    let mut bytes: Vec<u8> = (0..100_001u64)
+        .map(|i| {
+            let z = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            ((z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb) >> 56) as u8
+        })
+        .collect();
+    let fixture = Fixture::new("recipe2-round-trip", &bytes);
+    let old = fixture.root.join("old");
+    let new = fixture.root.join("new");
+    let wire = fixture.root.join("wire.zst");
+    std::fs::write(&old, &bytes).unwrap();
+    bytes.splice(40_000..40_000, [7, 9, 11]);
+    bytes[90_000] ^= 0x81;
+    std::fs::write(&new, &bytes).unwrap();
+    prediction::compress_v2(&old, &new, bytes.len() as u64, &wire).unwrap();
+    let mut data = std::fs::read(&wire).unwrap();
+    // Four of thirteen blocks are unchanged at their old place: not sent.
+    assert!(data.len() < 80_000, "{}", data.len());
+    let len = data.len() as u64;
+    data.extend_from_slice(b"next frame");
+    let apply_recipe = |input: &mut &[u8]| {
+        apply_frame(
+            &fixture.root,
+            "out",
+            0o644,
+            bytes.len() as u64,
+            Some(Basis::PredictedV2(&old)),
+            input.take(len),
+            Validation::NativeBuild,
+        )
+    };
+    let mut input = data.as_slice();
+    let dst = apply_recipe(&mut input).unwrap();
+    assert_eq!(input, b"next frame");
+    assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+    // The installed file as its own basis, as in a real fetch.
+    std::fs::copy(&old, &dst).unwrap();
+    let dst = apply_frame(
+        &fixture.root,
+        "out",
+        0o644,
+        bytes.len() as u64,
+        Some(Basis::PredictedV2(&dst)),
+        data.as_slice().take(len),
+        Validation::NativeBuild,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+    // A basis that is no longer what the machine encoded against: the digest
+    // of the written file differs, and nothing is installed.
+    let mut changed = std::fs::read(&old).unwrap();
+    changed[5] ^= 1;
+    std::fs::write(&old, changed).unwrap();
+    std::fs::write(&dst, b"previous valid output").unwrap();
+    assert!(is_delta_failure(
+        &apply_recipe(&mut data.as_slice()).unwrap_err()
+    ));
+    assert_eq!(std::fs::read(&dst).unwrap(), b"previous valid output");
+    std::fs::write(&old, b"short").unwrap();
+    assert!(is_delta_failure(
+        &apply_recipe(&mut data.as_slice()).unwrap_err()
+    ));
+    assert_eq!(std::fs::read(&dst).unwrap(), b"previous valid output");
+}
+
+/// Diagnostic: time both recipe versions on a real pair of builds.
+/// `JUSTRUST_RETURN_PAIR=old:new justrust test --lib -- --ignored return_cost`
+#[test]
+#[ignore = "needs two builds of one large executable"]
+fn return_cost_of_a_real_pair() {
+    let pair = std::env::var("JUSTRUST_RETURN_PAIR")
+        .unwrap_or_else(|_| "/tmp/lane-return/one.base:/tmp/lane-return/one.new".into());
+    let Some((old, new)) = pair.split_once(':') else {
+        return;
+    };
+    let (old, new) = (Path::new(old), Path::new(new));
+    if !old.is_file() || !new.is_file() || !available() {
+        return;
+    }
+    let fixture = Fixture::new("return-cost", b"x");
+    let size = new.metadata().unwrap().len();
+    let expected = std::fs::read(new).unwrap();
+    for round in 0..3 {
+        for version in [1, 2] {
+            let wire = fixture.root.join(format!("wire{version}.zst"));
+            let t = Instant::now();
+            if version == 1 {
+                prediction::compress(old, new, size, &wire).unwrap();
+            } else {
+                prediction::compress_v2(old, new, size, &wire).unwrap();
+            }
+            let encode = t.elapsed().as_secs_f64();
+            let data = std::fs::read(&wire).unwrap();
+            let t = Instant::now();
+            let dst = apply_frame(
+                &fixture.root,
+                "out",
+                0o755,
+                size,
+                Some(if version == 1 {
+                    Basis::Predicted(old)
+                } else {
+                    Basis::PredictedV2(old)
+                }),
+                data.as_slice().take(data.len() as u64),
+                Validation::NativeBuild,
+            )
+            .unwrap();
+            let apply = t.elapsed().as_secs_f64();
+            assert!(std::fs::read(&dst).unwrap() == expected);
+            eprintln!(
+                "return-cost round {round} v{version}: encode {encode:.3}s, apply {apply:.3}s, wire {} bytes",
+                data.len()
+            );
+        }
+    }
+}
+
+#[test]
 fn legacy_request_and_frame_do_not_negotiate_prediction() {
     let req: Request =
         serde_json::from_str(r#"{"cwd":"/p","args":[],"start":0,"have":[],"anchors":true}"#)
@@ -104,6 +292,7 @@ fn legacy_request_and_frame_do_not_negotiate_prediction() {
         frame,
         Frame::File {
             prediction_v1: false,
+            pack_us: None,
             ..
         }
     ));
@@ -386,7 +575,9 @@ impl Fixture {
             }],
             test_run: None,
             prediction_v1: false,
+            prediction_v2: false,
             anchors: false,
+            stream_full_v1: false,
         };
         Self {
             root,
@@ -430,6 +621,84 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn negotiated_large_regular_file_commits_only_after_verified_trailer() {
+    if !available() {
+        return;
+    }
+    let mut fixture = Fixture::new("full-stream", b"app");
+    fixture.req.have.clear();
+    let src = fixture.remote.join("app");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&src)
+        .unwrap()
+        .set_len(stream::MIN_SIZE)
+        .unwrap();
+    assert!(
+        fixture
+            .frames()
+            .iter()
+            .any(|(f, _)| matches!(f,Frame::File{len,..} if *len!=stream::TAG))
+    );
+    fixture.req.stream_full_v1 = true;
+    let mut wire = Vec::new();
+    serve_dir(&fixture.remote, &fixture.req, &fixture.sent, &mut wire).unwrap();
+    let mut reader = wire.as_slice();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(matches!(
+        serde_json::from_str::<Frame>(&line).unwrap(),
+        Frame::File {
+            len: stream::TAG,
+            base: None,
+            patch: false,
+            ..
+        }
+    ));
+    let mut remaining = reader;
+    let mut chunks = stream::Chunks::new(&mut remaining, stream::MIN_SIZE).unwrap();
+    std::io::copy(&mut chunks, &mut std::io::sink()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Frame>(remaining).unwrap(),
+        Frame::End
+    );
+    let payload = &reader[..reader.len() - remaining.len()];
+    let dest = fixture.root.join("received");
+    std::fs::write(&dest, b"original").unwrap();
+    let install = |bytes: &[u8], size, v| {
+        apply_frame(
+            &fixture.root,
+            "received",
+            0o644,
+            size,
+            None,
+            stream::Chunks::new(bytes, size).unwrap().take(stream::TAG),
+            v,
+        )
+    };
+    for cut in [1, 6, payload.len() - 12, payload.len() - 1] {
+        assert!(install(&payload[..cut], stream::MIN_SIZE, Validation::NativeBuild).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+    }
+    let mut corrupt = payload.to_vec();
+    *corrupt.last_mut().unwrap() ^= 1;
+    assert!(install(&corrupt, stream::MIN_SIZE, Validation::NativeBuild).is_err());
+    assert!(install(payload, stream::MIN_SIZE + 1, Validation::NativeBuild).is_err());
+    assert!(install(payload, stream::MIN_SIZE, Validation::Glibc217).is_err());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+    install(payload, stream::MIN_SIZE, Validation::NativeBuild).unwrap();
+    assert_eq!(dest.metadata().unwrap().len(), stream::MIN_SIZE);
+    let mut prefix = [0; 3];
+    std::fs::File::open(dest)
+        .unwrap()
+        .read_exact(&mut prefix)
+        .unwrap();
+    assert_eq!(&prefix, b"app");
 }
 
 #[test]
@@ -536,11 +805,16 @@ fn selected_pipeline_preserves_order_modes_and_stops_on_broken_output() {
     );
     for (i, (frame, data)) in frames[2..5].iter().enumerate() {
         let Frame::File {
-            name, mode, base, ..
+            name,
+            mode,
+            base,
+            pack_us,
+            ..
         } = frame
         else {
             panic!("expected file")
         };
+        assert!(pack_us.is_some_and(|us| us > 0));
         assert_eq!(name.as_str(), names[i]);
         assert_eq!(*mode, 0o701 + i as u32);
         assert_eq!(base.as_deref(), (i != 0).then_some(names[0]));

@@ -109,8 +109,13 @@ fn is_user_manager_argv(argv: &[&[u8]]) -> bool {
 /// PIDs of this process's parent chain (excluding itself).
 #[cfg(target_os = "linux")]
 fn ancestors_of_self() -> Vec<u32> {
+    ancestors_of(std::process::id())
+}
+
+/// PIDs of `pid`'s parent chain (excluding itself).
+#[cfg(target_os = "linux")]
+fn ancestors_of(mut pid: u32) -> Vec<u32> {
     let mut out = Vec::new();
-    let mut pid = std::process::id();
     for _ in 0..64 {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             break;
@@ -129,6 +134,72 @@ fn ancestors_of_self() -> Vec<u32> {
         pid = ppid;
     }
     out
+}
+
+/// Holders of the file locks that processes matching `waits` are blocked on,
+/// from `/proc/locks`: a blocked request is a `N: -> ...` line under the lock
+/// `N:` it waits for. Field 5 (4 after the arrow) is the pid.
+pub fn parse_lock_holders(locks: &str, waits: impl Fn(u32) -> bool) -> Vec<u32> {
+    let mut held: std::collections::HashMap<&str, u32> = Default::default();
+    let mut out = Vec::new();
+    for line in locks.lines() {
+        let mut f = line.split_whitespace();
+        let Some(id) = f.next() else { continue };
+        let rest: Vec<&str> = f.collect();
+        let blocked = rest.first() == Some(&"->");
+        let Some(pid) = rest
+            .get(3 + blocked as usize)
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !blocked {
+            held.insert(id, pid);
+        } else if waits(pid)
+            && let Some(&holder) = held.get(id)
+            && !waits(holder)
+            && !out.contains(&holder)
+        {
+            out.push(holder);
+        }
+    }
+    out
+}
+
+/// Who holds a file lock that this process or one below it is blocked on,
+/// one line each: `pid N (command line[, run ID])`. Empty when nothing is
+/// blocked, or off Linux.
+pub fn lock_holders_blocking_us() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let me = std::process::id();
+        let Ok(locks) = std::fs::read_to_string("/proc/locks") else {
+            return Vec::new();
+        };
+        parse_lock_holders(&locks, |p| p == me || ancestors_of(p).contains(&me))
+            .into_iter()
+            .map(|pid| {
+                let argv = std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .map(|b| join_args(&b))
+                    .unwrap_or_default();
+                let run = std::fs::read(format!("/proc/{pid}/environ"))
+                    .ok()
+                    .and_then(|e| {
+                        e.split(|&b| b == 0).find_map(|kv| {
+                            kv.strip_prefix(b"JUSTRUST_RUN_ID_OVERRIDE=")
+                                .map(|v| String::from_utf8_lossy(v).into_owned())
+                        })
+                    });
+                let argv: String = argv.chars().take(160).collect();
+                match run {
+                    Some(r) => format!("pid {pid} ({argv}, run {r})"),
+                    None => format!("pid {pid} ({argv})"),
+                }
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
 }
 
 /// A running executable or an mmap remains live after its original file
@@ -1113,6 +1184,65 @@ mod output_consumer_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_holder_of_a_lock_a_build_is_blocked_on_is_found() {
+        // Lock 2 has two waiters, lock 3 none; -1 is an open-file lock.
+        let locks = "\
+1: FLOCK  ADVISORY  WRITE 2176848 fe:10:1484522 0 EOF
+2: FLOCK  ADVISORY  WRITE 2950552 fe:10:3181970 0 EOF
+2: -> FLOCK  ADVISORY  WRITE 700 fe:10:3181970 0 EOF
+2: -> FLOCK  ADVISORY  WRITE 701 fe:10:3181970 0 EOF
+3: FLOCK  ADVISORY  READ 2950552 fe:10:3181968 0 EOF
+4: OFDLCK ADVISORY  WRITE -1 fe:10:99 0 EOF
+4: -> OFDLCK ADVISORY  WRITE -1 fe:10:99 0 EOF
+5: POSIX  ADVISORY  WRITE 800 fe:10:5 0 EOF
+5: -> POSIX  ADVISORY  WRITE 700 fe:10:5 0 EOF
+";
+        assert_eq!(parse_lock_holders(locks, |p| p == 700), [2950552, 800]);
+        // Both waiters are ours: the holder is named once.
+        assert_eq!(
+            parse_lock_holders(locks, |p| p == 700 || p == 701),
+            [2950552, 800]
+        );
+        // Our own process holding it is not somebody else's lock.
+        assert_eq!(
+            parse_lock_holders(locks, |p| p == 700 || p == 800),
+            [2950552]
+        );
+        assert!(parse_lock_holders(locks, |p| p == 1).is_empty());
+        assert!(parse_lock_holders("garbage\n\n9:\n", |_| true).is_empty());
+    }
+
+    /// The kernel's own format: a child really blocked on a lock we hold.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_really_blocked_child_shows_its_holder_in_proc_locks() {
+        let path = std::env::temp_dir().join(format!("jr-held-{}.lock", std::process::id()));
+        let held = std::fs::File::create(&path).unwrap();
+        held.lock().unwrap();
+        let Ok(mut child) = std::process::Command::new("flock")
+            .arg(&path)
+            .arg("true")
+            .spawn()
+        else {
+            return; // no flock(1) here
+        };
+        let (me, kid) = (std::process::id(), child.id());
+        let mut found = Vec::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let locks = std::fs::read_to_string("/proc/locks").unwrap();
+            found = parse_lock_holders(&locks, |p| p == kid);
+            if !found.is_empty() {
+                break;
+            }
+        }
+        drop(held);
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(found, [me]);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn child_hashes_running_image_after_unlink() {
@@ -1137,16 +1267,28 @@ mod tests {
         if std::fs::hard_link(&exe, &copy).is_err() {
             std::fs::copy(exe, &copy).unwrap();
         }
-        let result = std::process::Command::new(&copy)
-            .args([
-                "--exact",
-                "procfs::tests::child_hashes_running_image_after_unlink",
-            ])
-            .env(KEY, &dir)
-            .status();
+        // A copy was just written: a child another test is forking can hold
+        // it open for writing until it execs.
+        // Captured: the nested harness would otherwise write its own result
+        // lines into this process's stdout, between this harness's lines.
+        let result = crate::test_fork::exec_fresh(|| {
+            std::process::Command::new(&copy)
+                .args([
+                    "--exact",
+                    "procfs::tests::child_hashes_running_image_after_unlink",
+                ])
+                .env(KEY, &dir)
+                .output()
+        });
         let replaced = std::fs::metadata(&copy).unwrap().len() < 100;
         std::fs::remove_dir_all(dir).unwrap();
-        assert!(result.unwrap().success() && replaced);
+        let result = result.unwrap();
+        assert!(
+            result.status.success() && replaced,
+            "replaced {replaced}\n{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[cfg(target_os = "linux")]

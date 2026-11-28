@@ -297,8 +297,10 @@ pub fn mtime_f64(m: &Metadata) -> f64 {
 }
 
 /// Identity of the file a path names now: (device, inode) on Unix. Windows
-/// has no stable equivalent in std; creation time and size stand in, which
-/// still tells a replaced file from the original.
+/// has no stable equivalent in std, so size, last write and creation time
+/// stand in. Creation time alone does not tell a replaced file from the
+/// original: NTFS gives a file renamed over a name the creation time of the
+/// file that held the name just before (tunneling).
 pub fn file_id(m: &Metadata) -> (u64, u64) {
     #[cfg(unix)]
     {
@@ -312,8 +314,21 @@ pub fn file_id(m: &Metadata) -> (u64, u64) {
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_nanos() as u64);
-        (m.len(), created)
+        fallback_file_id(m.len(), mtime(m), created)
     }
+}
+
+/// `file_id` without an inode. The second field stays the creation time:
+/// file stamps hash it next to the size and write time they already carry.
+#[cfg(any(not(unix), test))]
+fn fallback_file_id(len: u64, written: (i64, i64), created: u64) -> (u64, u64) {
+    let written = (written.0 as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(written.1 as u64);
+    (
+        len ^ written.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17),
+        created,
+    )
 }
 
 /// Bytes the file occupies on disk (allocated blocks on Unix, the length
@@ -515,6 +530,97 @@ pub struct Usage {
     pub user: f64,
     pub sys: f64,
     pub max_rss_mb: f64,
+}
+
+/// The output pipe of a child process, read to the end of what the child
+/// itself wrote.
+pub trait OutputPipe: io::Read + Send + 'static {
+    /// Whether to keep reading: `false` once `exited` was set (the child was
+    /// reaped) and the pipe is empty and still open. Everything the child
+    /// wrote is in the pipe before it is reaped, so what remains open then is
+    /// a process the child started that inherited the pipe, and may hold it
+    /// for as long as it lives. Blocks until there is something to read, the
+    /// pipe closes, or that is known.
+    fn more(&self, exited: &std::sync::atomic::AtomicBool) -> bool;
+}
+
+#[cfg(unix)]
+fn pipe_more(fd: std::os::fd::RawFd, exited: &std::sync::atomic::AtomicBool) -> bool {
+    // Once the child is reaped and its pipe is empty, how long the pipe may
+    // stay open before that means a process the child left behind.
+    let mut grace = PIPE_HELD_GRACE_MS;
+    loop {
+        // Read the flag first: an empty pipe only means "all read" when the
+        // child had already exited before the pipe was looked at.
+        let done = exited.load(std::sync::atomic::Ordering::Acquire);
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait = if done {
+            grace.min(PIPE_HELD_STEP_MS)
+        } else {
+            50
+        };
+        // SAFETY: one valid pollfd.
+        let r = unsafe { libc::poll(&mut p, 1, wait) };
+        if r > 0 {
+            // Data, or every writer closed: `read` tells which.
+            return true;
+        }
+        if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return true;
+        }
+        if r == 0 && done {
+            // Open and empty is also what a process being started by another
+            // thread looks like: between its fork and its exec it holds a
+            // copy of every descriptor, close-on-exec ones included. Under
+            // load that window is long enough to be seen here, so only a
+            // pipe that stays open is one somebody keeps.
+            if grace <= 0 {
+                return false;
+            }
+            grace -= wait.max(1);
+        }
+    }
+}
+
+/// See [`pipe_more`]: far longer than a fork-to-exec window, far shorter than
+/// anything worth not waiting for.
+#[cfg(unix)]
+const PIPE_HELD_GRACE_MS: i32 = 250;
+#[cfg(unix)]
+const PIPE_HELD_STEP_MS: i32 = 10;
+
+#[cfg(unix)]
+impl OutputPipe for std::process::ChildStdout {
+    fn more(&self, exited: &std::sync::atomic::AtomicBool) -> bool {
+        pipe_more(std::os::fd::AsRawFd::as_raw_fd(self), exited)
+    }
+}
+
+#[cfg(unix)]
+impl OutputPipe for std::process::ChildStderr {
+    fn more(&self, exited: &std::sync::atomic::AtomicBool) -> bool {
+        pipe_more(std::os::fd::AsRawFd::as_raw_fd(self), exited)
+    }
+}
+
+// On Windows the child's tree is in a job object and the pipe is read to its
+// end, as before.
+#[cfg(windows)]
+impl OutputPipe for std::process::ChildStdout {
+    fn more(&self, _exited: &std::sync::atomic::AtomicBool) -> bool {
+        true
+    }
+}
+
+#[cfg(windows)]
+impl OutputPipe for std::process::ChildStderr {
+    fn more(&self, _exited: &std::sync::atomic::AtomicBool) -> bool {
+        true
+    }
 }
 
 /// No job objects on Unix: `wait4` already counts the waited-for
@@ -740,6 +846,20 @@ fn process_cpu(child: &std::process::Child) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_file_id_tells_a_same_size_replacement_with_tunneled_creation_time() {
+        let created = 1_795_000_000_000_000_000;
+        let original = fallback_file_id(2, (1_795_000_000, 100), created);
+        assert_eq!(original, fallback_file_id(2, (1_795_000_000, 100), created));
+        // Same name, size and (tunneled) creation time, written later.
+        let replaced = fallback_file_id(2, (1_795_000_000, 200), created);
+        assert_ne!(original, replaced);
+        assert_ne!(original, fallback_file_id(3, (1_795_000_000, 100), created));
+        // File stamps keep hashing the creation time.
+        assert_eq!(original.1, created);
+        assert_eq!(replaced.1, created);
+    }
 
     #[test]
     fn only_discharging_system_batteries_defer_eager_transfers() {

@@ -41,8 +41,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Updated only after reviewing and validating a new bootstrap client.
-  HOSTED_CLIENT_REV: c026ee88f391bcf74239efbc061bcca43640c17f
+  # The client is the published production release, resolved at run time
+  # (ci/install-published-client.py --resolve-production), never a pin.
   JUSTRUST_TOOLCHAIN: 1.99.0
   JUSTRUST_TOOLCHAIN_REQUIRED: "1"
   JUSTRUST_REMOTE_REQUIRED: "1"
@@ -66,17 +66,32 @@ jobs:
 
       - name: Install runner prerequisites
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends rsync zstd binutils qemu-user
+          set -euo pipefail
+          # Same shape as release.yml: rustup downloads while only the missing
+          # packages install, and the package index refreshes only if stale.
+          { rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0; } &
+          rustup_install=$!
+          packages=()
+          command -v rsync >/dev/null || packages+=(rsync)
+          command -v zstd >/dev/null || packages+=(zstd)
+          command -v readelf >/dev/null || packages+=(binutils)
+          command -v qemu-aarch64 >/dev/null || packages+=(qemu-user)
+          if (( ${#packages[@]} )); then
+            sudo apt-get install -y --no-install-recommends "${packages[@]}" || {
+              sudo apt-get update -q
+              sudo apt-get install -y --no-install-recommends "${packages[@]}"
+            }
+          fi
+          wait "$rustup_install"
 
-      - name: Install reviewed hosted client
+      - name: Install published production client
         run: |
-          git fetch --quiet --no-tags --depth=1 origin "$HOSTED_CLIENT_REV"
-          git show "$HOSTED_CLIENT_REV:ci/install-hosted-client.sh" > "$RUNNER_TEMP/install-hosted-client.sh"
-          git show "$HOSTED_CLIENT_REV:ci/check-linux-release.sh" > "$RUNNER_TEMP/check-linux-release.sh"
-          bash "$RUNNER_TEMP/install-hosted-client.sh" "$HOSTED_CLIENT_REV"
+          set -euo pipefail
+          python3 ci/install-published-client.py --resolve-production > "$RUNNER_TEMP/bootstrap.env"
+          cat "$RUNNER_TEMP/bootstrap.env"
+          python3 ci/install-published-client.py --github-path \
+            --tag "$(sed -n 's/^bootstrap_tag=//p' "$RUNNER_TEMP/bootstrap.env")" \
+            --sha256 "$(sed -n 's/^bootstrap_sha256=//p' "$RUNNER_TEMP/bootstrap.env")"
 
       - name: Build and verify both static musl releases
         env:
@@ -88,8 +103,8 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             justrust build --remote --release --locked --target "$target" --bin justrust \
               --config 'profile.release.lto="thin"' \
-              --config profile.release.codegen-units=1 --config profile.release.strip=true
-            bash "$RUNNER_TEMP/check-linux-release.sh" "target/$target/release/justrust" "$target" "$version"
+              --config profile.release.strip=true
+            bash ci/check-linux-release.sh "target/$target/release/justrust" "$target" "$version"
           done
 
       - uses: actions/upload-artifact@v4

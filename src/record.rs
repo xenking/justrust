@@ -360,6 +360,10 @@ pub fn main(args: Vec<OsString>) -> ! {
 /// Record `cargo <args>` and exit with cargo's exit code.
 pub fn run(args: Vec<OsString>, opts: Options) -> ! {
     crate::e2e::mark("routed");
+    // The build daemon's note is for this process only: out of the
+    // environment before cargo or a compiler can inherit it.
+    crate::buildd::waited_prebuild();
+    crate::buildd::build_stamp();
     let mut trace = PhaseTrace::new();
     if !should_record(&args) {
         exec_cargo(&args);
@@ -748,6 +752,9 @@ fn record(
     let selection = crate::toolchain::slots::selection()?;
     let pinned = compatible_toolchain(crate::toolchain::for_build(), args)?;
     let _compiler_lease = crate::toolchain::slots::lease(pinned.as_ref())?;
+    // Up to here the run may have waited for a toolchain lifecycle change on
+    // this machine, or installed its pinned compiler.
+    crate::e2e::mark("toolchain");
     require_selected_toolchain(
         requested.as_deref(),
         pinned.as_ref().map(|tc| tc.id.as_str()),
@@ -781,7 +788,7 @@ fn record(
         std::thread::spawn(move || crate::sched::enter(&id))
     };
     // Agent runs get a private target dir so parallel agents do not block.
-    let slot = opts.agent.then(|| slots::acquire(args)).flatten();
+    let mut slot = opts.agent.then(|| slots::acquire_for(args, id)).flatten();
     let cargo_args = slot.as_ref().map_or(args, |s| s.args.as_slice());
     trace.mark("slot");
 
@@ -1034,6 +1041,11 @@ fn record(
     CHILD_PID.store(0, Ordering::SeqCst);
     let _ = t_out.join();
     let _ = t_err.join();
+    // Cargo has exited; release the slot lock before draining pooled tests so
+    // an identical build waiting on this slot does not sit behind our test run.
+    if let Some(s) = slot.as_mut() {
+        s.release();
+    }
     let mut pooled_spans = Vec::new();
     if let Some(p) = pool {
         // Binaries cargo handed over may still be running.
@@ -1124,6 +1136,16 @@ fn record(
         // Detached and at most hourly; never delays or fails this run.
         slots::maybe_gc_background(&s.info);
     }
+    // Stale incremental state: detached, at most hourly per directory.
+    let incr_target = match &slot {
+        Some(s) => {
+            crate::incr_gc::target_base(Path::new(&s.info.target_dir), s.info.slot.is_some())
+        }
+        None => std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(&meta.cwd).join("target")),
+    };
+    crate::incr_gc::maybe_background(Some(&incr_target));
     trace.mark("cleanup");
     Ok(code)
 }
@@ -1174,7 +1196,7 @@ fn finish(
         serde_json::to_vec_pretty(procs)?,
     )?;
     let mut units = summary::load_units(run_dir);
-    units.extend(summary::units_from_wrapper_procs(procs));
+    units.extend(summary::units_from_wrapper_procs(procs, run_dir));
     let mut s = summary::build(
         meta,
         git,
@@ -1190,6 +1212,24 @@ fn finish(
     );
     s.sched = sched;
     s.savings = crate::savings::from_dir(run_dir);
+    s.lock_holders = std::mem::take(&mut *LOCK_HOLDERS.lock().unwrap());
+    if let Some((pre_id, waited)) = crate::buildd::waited_prebuild() {
+        // Its record is next to this run's: it exited before this run began.
+        let pre = run_dir
+            .parent()
+            .and_then(|runs| std::fs::read(runs.join(&pre_id).join("summary.json")).ok())
+            .and_then(|b| serde_json::from_slice::<summary::Summary>(&b).ok());
+        s.credit_prebuild(&pre_id, waited, pre.as_ref());
+    }
+    // Waited in a slot for the identical build: that run compiled the units.
+    if let Some(joined) = s.slot.as_ref().and_then(|i| i.joined_run.clone())
+        && let Some(j) = run_dir
+            .parent()
+            .and_then(|runs| std::fs::read(runs.join(&joined).join("summary.json")).ok())
+            .and_then(|b| serde_json::from_slice::<summary::Summary>(&b).ok())
+    {
+        s.credit_join(&j);
+    }
     if let Some(mut e) = early {
         let root = crate::early::workspace_root(Path::new(&meta.cwd))
             .unwrap_or_else(|| PathBuf::from(&meta.cwd));
@@ -1435,6 +1475,9 @@ fn push_line(lines: &Mutex<OutputCapture>, t: f64, stream: &str, raw: &[u8]) {
     if text.trim().is_empty() {
         return;
     }
+    if text.contains("Blocking waiting for file lock on ") {
+        note_lock_holders();
+    }
     let line = OutputLine {
         t,
         s: stream.to_owned(),
@@ -1443,6 +1486,27 @@ fn push_line(lines: &Mutex<OutputCapture>, t: f64, stream: &str, raw: &[u8]) {
     let mut capture = lines.lock().unwrap();
     capture.journal.append(&line);
     capture.lines.push(line);
+}
+
+/// Who held the locks this run waited for ([`procfs::lock_holders_blocking_us`]).
+static LOCK_HOLDERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Cargo said it is blocked on a file lock: look at who holds it, off the
+/// output thread. Cargo prints before it blocks, and the holder can change
+/// during a long wait, so look twice.
+fn note_lock_holders() {
+    std::thread::spawn(|| {
+        for wait_ms in [100, 2000] {
+            std::thread::sleep(Duration::from_millis(wait_ms));
+            let found = procfs::lock_holders_blocking_us();
+            let mut all = LOCK_HOLDERS.lock().unwrap();
+            for h in found {
+                if !all.contains(&h) && all.len() < 8 {
+                    all.push(h);
+                }
+            }
+        }
+    });
 }
 
 pub fn strip_ansi(s: &str) -> String {
@@ -1495,9 +1559,7 @@ fn classify_proc(comm: &str, cmdline: &str) -> &'static str {
         | "ld.gold" | "mold" | "wild" | "collect2" | "lld" | "fast-linker" => return "linker",
         _ => {}
     }
-    if comm.starts_with("build-script")
-        || crate::sys::has_dir(exe, "build") && exe.contains("build-script")
-    {
+    if crate::gaps::is_build_script(comm, exe) {
         return "build-script";
     }
     if crate::sys::has_dir(exe, "target") || crate::sys::has_dir(exe, "deps") {
@@ -2287,7 +2349,12 @@ mod tests {
         let target = OsString::from("wasm32-unknown-unknown");
         assert!(!super::target_has_core(&rustc, &target));
         std::fs::write(lib.join("libcore-abc.rmeta"), b"").unwrap();
-        assert!(super::target_has_core(&rustc, &target));
+        // The probe reports a script it cannot run as "no". The script was
+        // just written, and a child another test is forking can hold it open
+        // for writing until it execs, so wait that window out.
+        assert!(crate::test_fork::eventually(|| super::target_has_core(
+            &rustc, &target
+        )));
         std::fs::write(
             &rustc,
             format!(
@@ -2296,10 +2363,10 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(super::target_has_core(
+        assert!(crate::test_fork::eventually(|| super::target_has_core(
             &rustc,
             &OsString::from(crate::remote_artifacts::GLIBC_217_TARGET)
-        ));
+        )));
         assert!(!super::target_has_core(
             &rustc,
             &OsString::from("x86_64-unknown-linux-gnu.2.18")

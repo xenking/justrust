@@ -1,9 +1,12 @@
 //! The resident build daemon: `justrust __buildd`.
 //!
-//! One per user, started on demand by the first agent build that wants it,
-//! exits after 15 minutes without requests or running builds. Agent builds
-//! (`justrust check|test|build|clippy`) hand their request to it over
-//! `~/.justrust/buildd/sock` instead of running cargo themselves:
+//! One per user and justrust build, started on demand by the first agent
+//! build that wants it, exits after 15 minutes without requests or running
+//! builds. Agent builds (`justrust check|test|build|clippy`) hand their
+//! request to it over `~/.justrust/buildd/<build>.sock` instead of running
+//! cargo themselves. Clients of different builds (a pinned CI client and a
+//! newer developer client on one hosted machine, or the client before and
+//! after an update) each talk to a daemon of their own build:
 //!
 //! - **Coalescing.** A request is identified by its working directory, its
 //!   full argv, the environment that can change the result (everything
@@ -30,7 +33,7 @@
 //! daemon from another justrust build before any output arrived means the
 //! build runs in the client as before. On by default for non-terminal
 //! agent builds on Linux; `JUSTRUST_BUILDD=0` disables the daemon,
-//! `JUSTRUST_BUILDD_PREBUILD=0` only prebuilds (FINDINGS.md, build daemon).
+//! `JUSTRUST_BUILDD_PREBUILD=0` disables speculative prebuilds.
 //! Experimental `JUSTRUST_BUILDD_NATIVE_EMPTY=1` skips source validation only
 //! when no active or finished candidate exists. Native Cargo still runs, and
 //! the unvalidated execution can never be attached to or replayed.
@@ -55,6 +58,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod warm;
+
 pub const DAEMON_ARG: &str = "__buildd";
 /// Set on the builds the daemon runs: they never go back to the daemon.
 const CHILD_ENV: &str = "JUSTRUST_BUILDD_CHILD";
@@ -63,6 +68,60 @@ const CHILD_ENV: &str = "JUSTRUST_BUILDD_CHILD";
 /// to a local compile after a remote failure, never compiles locally on
 /// battery, and does not bring compile-only test executables back.
 pub const GUESS_ENV: &str = "JUSTRUST_BUILDD_GUESS";
+
+/// Set on a build whose units a compile-only prebuild compiled first:
+/// `<prebuild run id> <seconds this request waited for it>`. That build
+/// finds the units Fresh and would otherwise report that nothing was
+/// compiled, with the wait in nobody's record.
+pub const WAITED_ENV: &str = "JUSTRUST_BUILDD_WAITED";
+
+fn waited_env(run_id: Option<&str>, secs: f64) -> Option<String> {
+    let id = run_id?;
+    let ok = !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    (ok && secs.is_finite() && secs >= 0.0).then(|| format!("{id} {secs:.3}"))
+}
+
+/// The prebuild whose units this process's build reuses: its run id and the
+/// seconds the daemon held this request back for it. Taken out of the
+/// environment on first use, so call it before anything is spawned: the
+/// note must never reach cargo, a compiler or a cache key.
+pub fn waited_prebuild() -> Option<(String, f64)> {
+    static NOTE: std::sync::OnceLock<Option<(String, f64)>> = std::sync::OnceLock::new();
+    NOTE.get_or_init(|| {
+        let v = std::env::var(WAITED_ENV).ok()?;
+        // SAFETY: single-threaded where the recorder first asks.
+        unsafe { std::env::remove_var(WAITED_ENV) };
+        parse_waited(&v)
+    })
+    .clone()
+}
+
+/// Set on every build the daemon starts: its stamp of the sources the build
+/// was started for. A slot records it, so the same command started after an
+/// edit does not wait for a build of the old sources (`slots`).
+pub const STAMP_ENV: &str = "JUSTRUST_BUILDD_STAMP";
+
+/// This process's [`STAMP_ENV`]. Taken out of the environment on first use,
+/// like [`waited_prebuild`], and for the same reason.
+pub fn build_stamp() -> Option<String> {
+    static STAMP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    STAMP
+        .get_or_init(|| {
+            let v = std::env::var(STAMP_ENV).ok()?;
+            // SAFETY: single-threaded where the recorder first asks.
+            unsafe { std::env::remove_var(STAMP_ENV) };
+            let ok = !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric());
+            ok.then_some(v)
+        })
+        .clone()
+}
+
+fn parse_waited(v: &str) -> Option<(String, f64)> {
+    let (id, secs) = v.split_once(' ')?;
+    let secs: f64 = secs.parse().ok()?;
+    let ok = !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    (ok && secs.is_finite() && secs >= 0.0).then(|| (id.to_owned(), secs))
+}
 const IDLE_EXIT: Duration = Duration::from_secs(900);
 
 /// Variables that identify the agent or its terminal, not the build. Two
@@ -93,9 +152,18 @@ const IGNORED_ENV: &[&str] = &[
     "SHLVL",
     "_",
     "JUSTRUST_SLOT_SESSION",
+    // The connection a hosted client arrived on, source port included: it
+    // differs for every client and after every reconnect of the same one,
+    // and says nothing about the build.
+    "SSH_CLIENT",
+    "SSH_CONNECTION",
+    "SSH_TTY",
     // Benchmarks pin run ids; an attached request links its id to the
     // shared run instead (`Exit::run_id`).
     "JUSTRUST_RUN_ID_OVERRIDE",
+    // The daemon's own note to a build; never part of what was asked.
+    WAITED_ENV,
+    STAMP_ENV,
 ];
 const IGNORED_ENV_PREFIXES: &[&str] = &["KITTY_", "JCODE_SPAWN_", "JCODE_TUI_", "JCODE_RELOAD_"];
 
@@ -117,6 +185,36 @@ pub const GUESS_DROPPED: i32 = 75;
 /// A prebuild that declined to run.
 fn dropped_guess(b: &Build, l: &Log) -> bool {
     l.exit == Some(GUESS_DROPPED) && *b.prebuild.lock().unwrap()
+}
+
+/// Exit codes of a process ended by SIGHUP, SIGINT, SIGKILL or SIGTERM.
+const SIGNAL_EXITS: [i32; 4] = [129, 130, 137, 143];
+
+/// The daemon stopped this build (a wrong guess, older sources, nobody left
+/// waiting). Marked before the signal, so that no request can take a build
+/// that is about to die for one that is running.
+fn stop(b: &Build) {
+    b.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Never pid 0: that is this process's own group.
+    if b.pid > 0 {
+        crate::sys::terminate_group(b.pid, false);
+    }
+}
+
+fn stopped(b: &Build) -> bool {
+    b.stopped.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Not the outcome of building these sources, whatever its exit code says:
+/// a guess that declined to run, a build the daemon stopped, or a prebuild
+/// nobody had asked for that a signal ended. A kill says nothing about the
+/// sources, so the request builds for itself.
+fn no_result(b: &Build, l: &Log) -> bool {
+    dropped_guess(b, l)
+        || stopped(b)
+        || (*b.prebuild.lock().unwrap()
+            && !l.claimed
+            && l.exit.is_some_and(|c| SIGNAL_EXITS.contains(&c)))
 }
 
 /// This process is a prebuild: started on a guess, with nobody waiting.
@@ -144,8 +242,66 @@ fn dir() -> Result<PathBuf> {
     Ok(crate::paths::home()?.join("buildd"))
 }
 
+/// File stem of this build's daemon socket and lock. A daemon only serves
+/// clients of its own build, so each build gets its own pair: two builds
+/// sharing one pair evicted each other's daemon on every alternating request,
+/// and while the evicted one drained its builds nobody could start a daemon
+/// at all (each request then waited out the 3 s start timeout).
+fn build_stem(build: &str) -> String {
+    match build.strip_prefix("sha256-") {
+        Some(hex) if hex.len() >= 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            hex[..16].to_owned()
+        }
+        // An unreadable binary has a per-process id: nothing to share.
+        _ => "unidentified".to_owned(),
+    }
+}
+
+fn stem() -> String {
+    build_stem(&crate::remote_daemon::build_id())
+}
+
 pub fn sock_path() -> Result<PathBuf> {
-    Ok(dir()?.join("sock"))
+    Ok(dir()?.join(format!("{}.sock", stem())))
+}
+
+fn lock_path() -> Result<PathBuf> {
+    Ok(dir()?.join(format!("{}.lock", stem())))
+}
+
+/// Locks and sockets of builds that have had no daemon for this long go.
+const STALE_BUILD_FILES: Duration = Duration::from_secs(24 * 3600);
+
+/// Remove the socket and lock files daemons of other builds left behind.
+/// A lock is only removed while this process holds it, and a starting daemon
+/// checks that the lock it took is still the file at its path (`daemon`), so
+/// no two daemons of one build can result.
+fn sweep_stale(d: &Path, mine: &Path, older_than: Duration) {
+    let Ok(rd) = std::fs::read_dir(d) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p == mine || p.extension().is_none_or(|x| x != "lock") {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if !old {
+            continue;
+        }
+        let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) else {
+            continue;
+        };
+        if f.try_lock().is_ok() {
+            let _ = std::fs::remove_file(p.with_extension("sock"));
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ frames
@@ -608,9 +764,256 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// Every package directory a build in `cwd` can compile from local source:
+/// the workspace root, its members, and every path dependency reachable from
+/// their manifests or named by a cargo config file (`[patch]`, `paths`).
+/// `None` when a manifest, a config file or a member pattern cannot be read
+/// with certainty, so that a caller pruning by this list falls back to pruning
+/// nothing.
+fn local_packages(cwd: &Path, configs: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    fn paths(v: &toml::Value, out: &mut Vec<String>) {
+        match v {
+            toml::Value::Table(t) => {
+                for (k, v) in t {
+                    match v {
+                        toml::Value::String(s) if k == "path" => out.push(s.clone()),
+                        _ => paths(v, out),
+                    }
+                }
+            }
+            toml::Value::Array(a) => a.iter().for_each(|v| paths(v, out)),
+            _ => {}
+        }
+    }
+    let root = crate::early::workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let mut dirs = vec![root.clone()];
+    let mut pending = vec![root];
+    for config in configs {
+        let Ok(text) = std::fs::read_to_string(config) else {
+            continue;
+        };
+        let table: toml::Table = text.parse().ok()?;
+        // Relative to the directory holding `.cargo`.
+        let base = config.parent().and_then(Path::parent)?;
+        let mut named = Vec::new();
+        if let Some(overrides) = table.get("paths").and_then(|p| p.as_array()) {
+            named.extend(
+                overrides
+                    .iter()
+                    .filter_map(|p| p.as_str().map(String::from)),
+            );
+        }
+        paths(&toml::Value::Table(table), &mut named);
+        for p in named.iter().map(|p| normalize(&base.join(p))) {
+            if p.join("Cargo.toml").is_file() {
+                dirs.push(p.clone());
+                pending.push(p);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    while let Some(dir) = pending.pop() {
+        if !seen.insert(dir.clone()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+        let manifest: toml::Table = text.parse().ok()?;
+        let mut found = Vec::new();
+        if let Some(members) = manifest
+            .get("workspace")
+            .and_then(|w| w.get("members"))
+            .and_then(|m| m.as_array())
+        {
+            for member in members {
+                found.extend(expand_member(&dir, member.as_str()?)?);
+            }
+        }
+        let mut named = Vec::new();
+        paths(&toml::Value::Table(manifest), &mut named);
+        // `path` of a [lib]/[[bin]] target names a file, not a crate.
+        found.extend(named.iter().map(|p| normalize(&dir.join(p))));
+        for p in found {
+            if p.join("Cargo.toml").is_file() {
+                dirs.push(p.clone());
+                pending.push(p);
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    Some(dirs)
+}
+
+/// The directories a `[workspace] members` entry names. Literal components
+/// and `*`/`?` within one component are expanded; anything else (`**`,
+/// character classes) is `None`: not understood, so nothing may be pruned.
+fn expand_member(base: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
+    let mut dirs = vec![base.to_path_buf()];
+    for part in Path::new(pattern).components() {
+        let std::path::Component::Normal(part) = part else {
+            dirs.iter_mut().for_each(|d| d.push(part));
+            continue;
+        };
+        let part = part.to_str()?;
+        if part.contains(['[', ']', '{', '}']) || part.contains("**") {
+            return None;
+        }
+        if !part.contains(['*', '?']) {
+            dirs.iter_mut().for_each(|d| d.push(part));
+            continue;
+        }
+        let mut next = Vec::new();
+        for d in &dirs {
+            let Ok(rd) = std::fs::read_dir(d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                if e.file_name().to_str().is_some_and(|n| wildcard(part, n)) {
+                    next.push(e.path());
+                }
+            }
+        }
+        dirs = next;
+    }
+    Some(dirs.iter().map(|d| normalize(d)).collect())
+}
+
+/// `*` and `?` within one path component.
+fn wildcard(pattern: &str, name: &str) -> bool {
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            star = Some((sp, sn + 1));
+            pi = sp + 1;
+            ni = sn + 1;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|b| *b == b'*')
+}
+
+/// What the stamp leaves out under one root.
+///
+/// Always: build output and hidden directories (except `.cargo`, whose
+/// config changes builds).
+///
+/// In a source mirror on a build machine, also what the mirror's
+/// `.justrustignore` keeps out of it. The sync never writes those paths, so
+/// whatever an older mirror left there cannot change between two builds, yet
+/// here they were 93,025 of the 94,450 files stamped before every build of
+/// this repository (`/toolchain/`, `/bench/results/`), 150-320 ms warm and 2 s
+/// once the kernel had dropped their inodes. A mirror is recognised by the
+/// sync's own checkpoint token, which only a build machine's agent writes: a
+/// local checkout has none and is stamped in full, because a local build can
+/// read an edit anywhere in it.
+///
+/// The one local checkout that is stamped like a mirror is on a machine where
+/// local compiles are off (`justrust local off`): every build of it runs on a
+/// build machine, from a mirror that leaves the same paths out, so an edit
+/// there cannot reach any build. Here that was 380,000 of 385,000 files and
+/// 1.5 s before every build of this repository (104 requests, 184 s), and an
+/// edit under `toolchain/` stopped and restarted the client's prebuild.
+///
+/// A package of this build inside an excluded tree is mirrored as a root of
+/// its own (`remote_build::roots_of`), so the build does see edits to it:
+/// those directories (`MirrorIgnore::packages`), and the way down to them,
+/// are never pruned.
+struct Prune {
+    mirror: Option<MirrorIgnore>,
+}
+
+struct MirrorIgnore {
+    root: PathBuf,
+    rules: crate::remote_sync::JustrustIgnore,
+    packages: Vec<PathBuf>,
+}
+
+impl Prune {
+    fn of(root: &Path, cwd: &Path, configs: &[PathBuf], hosted_only: bool) -> Self {
+        Self {
+            mirror: MirrorIgnore::of(root, cwd, configs, hosted_only),
+        }
+    }
+
+    fn hidden_or_output(name: &str) -> bool {
+        name == "target"
+            || name.starts_with("target-")
+            || (name.starts_with('.') && name != ".cargo")
+    }
+
+    /// Whether the stamp leaves out `path`, an entry called `name`.
+    fn skips(&self, path: &Path, name: &str, is_dir: bool) -> bool {
+        (is_dir && Self::hidden_or_output(name))
+            || self.mirror.as_ref().is_some_and(|m| m.skips(path, is_dir))
+    }
+}
+
+impl MirrorIgnore {
+    fn of(root: &Path, cwd: &Path, configs: &[PathBuf], hosted_only: bool) -> Option<Self> {
+        #[cfg(test)]
+        if tests::STAMP_EVERYTHING.with(|on| on.get()) {
+            return None;
+        }
+        // The nearest mirror root at or above: a workspace below its
+        // repository's root is mirrored with the repository. Where every
+        // build is hosted, the checkout's repository is what gets mirrored
+        // (`remote_build::roots_of`); outside git the whole workspace is,
+        // and nothing is left out.
+        let mirror = root
+            .ancestors()
+            .find(|a| a.join(crate::remote_checkpoint::TOKEN_FILE).is_file())
+            .or_else(|| {
+                hosted_only
+                    .then(|| root.ancestors().find(|a| a.join(".git").exists()))
+                    .flatten()
+            })?;
+        if !mirror.join(".justrustignore").is_file() {
+            return None;
+        }
+        let rules = crate::remote_sync::JustrustIgnore::load(mirror);
+        // Only a package the rules exclude is a root of its own. The others
+        // are mirrored with this root, under its rules.
+        let mut packages = local_packages(cwd, configs)?;
+        packages.retain(|p| p.strip_prefix(mirror).is_ok_and(|rel| rules.matches(rel)));
+        Some(Self {
+            root: mirror.to_path_buf(),
+            rules,
+            packages,
+        })
+    }
+
+    fn skips(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        self.rules.matches(rel)
+            && !self
+                .packages
+                .iter()
+                .any(|p| path.starts_with(p) || (is_dir && p.starts_with(path)))
+    }
+}
+
+/// Whether no build of this request's sources can compile on this machine.
+fn hosted_only(env: &[(String, String)]) -> bool {
+    #[cfg(test)]
+    if tests::LOCAL_OFF.with(|on| on.get()) {
+        return true;
+    }
+    crate::nolocal::disabled_in(env)
+}
+
 /// Hash of the source state under `roots`: every file's path, size, mtime
-/// and inode, skipping build output and hidden directories (except
-/// `.cargo`, whose config changes builds), plus cargo config files in the
+/// and inode that `Prune` does not leave out, plus cargo config files in the
 /// ancestors of `cwd` and in CARGO_HOME.
 pub fn source_stamp(roots: &[PathBuf], cwd: &Path, env: &[(String, String)]) -> (String, usize) {
     source_stamp_observed(roots, cwd, env, |_| {})
@@ -625,7 +1028,7 @@ fn source_stamp_observed(
     phase: impl FnMut(&'static str),
 ) -> (String, usize) {
     let mut phase = phase;
-    stamp_walk(roots, cwd, env, |root, add| {
+    stamp_walk(roots, cwd, env, |root, prune, add| {
         phase("root-start");
         // Sorted siblings visited depth first produce Path's component order.
         let mut stack = vec![(root.to_owned(), true)];
@@ -642,17 +1045,13 @@ fn source_stamp_observed(
             let first = stack.len();
             for entry in rd.flatten() {
                 let Ok(ft) = entry.file_type() else { continue };
-                if ft.is_dir() {
-                    let name = entry.file_name();
-                    let n = name.to_string_lossy();
-                    if n == "target"
-                        || n.starts_with("target-")
-                        || (n.starts_with('.') && n != ".cargo")
-                    {
-                        continue;
-                    }
+                let path = entry.path();
+                if (ft.is_dir() || prune.mirror.is_some())
+                    && prune.skips(&path, &entry.file_name().to_string_lossy(), ft.is_dir())
+                {
+                    continue;
                 }
-                stack.push((entry.path(), ft.is_dir()));
+                stack.push((path, ft.is_dir()));
             }
             stack[first..].sort_unstable_by(|a, b| b.0.as_os_str().cmp(a.0.as_os_str()));
         }
@@ -668,7 +1067,7 @@ fn source_stamp_with_sort(
     mut phase: impl FnMut(&'static str),
     mut sort: impl FnMut(&mut [(PathBuf, std::fs::Metadata)]),
 ) -> (String, usize) {
-    stamp_walk(roots, cwd, env, |r, add| {
+    stamp_walk(roots, cwd, env, |r, prune, add| {
         phase("root-start");
         let mut stack = vec![r.to_owned()];
         let mut entries: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
@@ -680,13 +1079,10 @@ fn source_stamp_with_sort(
                 let name = e.file_name();
                 let n = name.to_string_lossy();
                 let Ok(ft) = e.file_type() else { continue };
+                if prune.skips(&e.path(), &n, ft.is_dir()) {
+                    continue;
+                }
                 if ft.is_dir() {
-                    if n == "target"
-                        || n.starts_with("target-")
-                        || (n.starts_with('.') && n != ".cargo")
-                    {
-                        continue;
-                    }
                     stack.push(e.path());
                 } else if let Ok(m) = std::fs::metadata(e.path()) {
                     entries.push((e.path(), m));
@@ -709,7 +1105,7 @@ fn stamp_walk(
     roots: &[PathBuf],
     cwd: &Path,
     env: &[(String, String)],
-    mut walk: impl FnMut(&Path, &mut dyn FnMut(&Path, &std::fs::Metadata)),
+    mut walk: impl FnMut(&Path, &Prune, &mut dyn FnMut(&Path, &std::fs::Metadata)),
 ) -> (String, usize) {
     let mut h = crate::depcache::H128::new();
     let mut files = 0usize;
@@ -721,12 +1117,6 @@ fn stamp_walk(
         h.field(&ns.to_le_bytes());
         h.field(&crate::sys::file_id(m).1.to_le_bytes());
     };
-    for r in roots {
-        walk(r, &mut |p, m| {
-            files += 1;
-            add(p, m);
-        });
-    }
     let cargo_home = env
         .iter()
         .find(|(k, _)| k == "CARGO_HOME")
@@ -739,6 +1129,13 @@ fn stamp_walk(
     if let Some(ch) = cargo_home {
         configs.push(ch.join("config.toml"));
         configs.push(ch.join("config"));
+    }
+    let hosted_only = hosted_only(env);
+    for r in roots {
+        walk(r, &Prune::of(r, cwd, &configs, hosted_only), &mut |p, m| {
+            files += 1;
+            add(p, m);
+        });
     }
     for c in configs {
         if let Ok(m) = std::fs::metadata(&c) {
@@ -823,13 +1220,22 @@ struct Build {
     /// A `test` prebuilt as `test --no-run`: requests wait for it, then run
     /// for real (on Fresh units), never take its output.
     compile_only: Mutex<bool>,
+    /// What a compile-only prebuild compiles ([`units_key`]): a request for
+    /// other tests of the same units waits for it too.
+    units_key: Mutex<Option<String>>,
     /// Agent session that asked (`JUSTRUST_SLOT_SESSION`).
     session: String,
+    /// Workspace directory (`req.cwd`).
+    cwd: String,
     run_id: Option<String>,
     started: Instant,
     finished: Mutex<Option<Instant>>,
     pid: i32,
     prebuild: Mutex<bool>,
+    /// The daemon terminated it ([`stop`]): its exit is not a result.
+    stopped: std::sync::atomic::AtomicBool,
+    /// A prebuild's [`prebuild_claim`], held until it exits.
+    claim: Mutex<Option<std::fs::File>>,
     log: Mutex<Log>,
     cv: Condvar,
 }
@@ -844,10 +1250,18 @@ struct State {
     finished: HashMap<String, Arc<Build>>,
     /// Requests to prebuild when their sources change, by request key.
     recent: HashMap<String, Recent>,
+    /// Per-workspace (`cwd`) adaptive backoff after wasted/cancelled prebuilds.
+    prebuild_backoff: HashMap<String, PrebuildBackoff>,
     served: u64,
     coalesced: u64,
     prebuilt: u64,
     last_request: Option<Instant>,
+}
+
+#[derive(Default)]
+struct PrebuildBackoff {
+    misses: u32,
+    cooldown_until: Option<Instant>,
 }
 
 /// A request to prebuild when its sources change (`JUSTRUST_BUILDD_PREBUILD=0` disables).
@@ -855,6 +1269,9 @@ struct Recent {
     req: Request,
     roots: Vec<PathBuf>,
     used: Instant,
+    /// Number of real requests seen for this key. Prebuilds only start once
+    /// an edit-build loop is established (`seen >= MIN_REQUESTS_TO_PREBUILD`).
+    seen: u32,
     /// Prebuilds left until the agent asks again. Bounds the loop of a
     /// build that writes into its own sources (snapshot tests, generated
     /// files): each of its writes would otherwise start another prebuild.
@@ -862,6 +1279,9 @@ struct Recent {
 }
 
 const PREBUILDS_PER_REQUEST: u8 = 3;
+/// Require at least two real requests for the same command before firing
+/// speculative prebuilds, so one-off commands don't waste build slots.
+const MIN_REQUESTS_TO_PREBUILD: u32 = 2;
 
 /// Prebuild only what was asked for lately: each agent session's last
 /// request (right for 53% of 3,436 mined post-edit build calls, 0.47
@@ -884,6 +1304,8 @@ struct Daemon {
     /// (path, dev, ino) of our executable at startup: detect atomic replacement.
     exe: Option<(PathBuf, (u64, u64))>,
     draining: std::sync::atomic::AtomicBool,
+    /// Prebuilds after a toolchain change or a daemon replacement.
+    warm: warm::Warm,
 }
 
 impl Daemon {
@@ -930,14 +1352,27 @@ pub fn daemon_main() -> ! {
 fn daemon() -> Result<()> {
     let d = dir()?;
     std::fs::create_dir_all(&d)?;
+    let lock_path = lock_path()?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(d.join("lock"))?;
+        .open(&lock_path)?;
     if lock.try_lock().is_err() {
         bail!("another build daemon is running");
     }
+    // A sweeper may have removed the file between the open and the lock.
+    let same_file = |a: std::io::Result<std::fs::Metadata>,
+                     b: std::io::Result<std::fs::Metadata>| {
+        matches!((a, b), (Ok(a), Ok(b)) if crate::sys::file_id(&a) == crate::sys::file_id(&b))
+    };
+    if !same_file(lock.metadata(), std::fs::metadata(&lock_path)) {
+        bail!("the build daemon lock was replaced while starting");
+    }
+    // Its mtime says when a daemon of this build last started.
+    let _ = (&lock).write_all(b"\n");
+    let _ = lock.set_len(0);
+    sweep_stale(&d, &lock_path, STALE_BUILD_FILES);
     let sock = sock_path()?;
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
@@ -947,6 +1382,7 @@ fn daemon() -> Result<()> {
         crate::remote_daemon::build_id()
     ));
     let (wtx, wrx) = std::sync::mpsc::channel::<PathBuf>();
+    let warm = warm::Warm::new(wtx.clone());
     let watcher = crate::remote_watch::Watcher::new(wtx)
         .map_err(|e| log(&format!("no file watcher, prebuilds off: {e:#}")))
         .ok();
@@ -960,7 +1396,12 @@ fn daemon() -> Result<()> {
         sock: (sock, crate::sys::file_id(&md)),
         exe: current_exe_identity(),
         draining: Default::default(),
+        warm,
     });
+    {
+        let dm = dm.clone();
+        std::thread::spawn(move || warm::run(&dm));
+    }
     {
         let dm = dm.clone();
         std::thread::spawn(move || {
@@ -1079,16 +1520,51 @@ fn run(dm: &Arc<Daemon>, req: Request, mut s: UnixStream) -> Result<()> {
         }
     };
     if let Some(build) = native {
-        return serve_build(dm, &req, &roots, &mut s, build, false, false, t0, 0.0, 0.0);
+        return serve_build(
+            dm,
+            &req,
+            &roots,
+            &mut s,
+            build,
+            false,
+            false,
+            t0,
+            (0.0, 0),
+            0.0,
+        );
     }
-    let (stamp, _files) = source_stamp(&roots, &cwd, &req.env);
-    let scan_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let (stamp, files) = source_stamp(&roots, &cwd, &req.env);
+    let scan = (t0.elapsed().as_secs_f64() * 1000.0, files);
     let wait_start = Instant::now();
+    // The compile-only prebuild whose units this request reuses, and how
+    // long the request waited for it.
+    let mut waited_for: Option<(Arc<Build>, f64)> = None;
     if !req.prebuild {
         cancel_stale_prebuild(dm, &key, &stamp);
+        // Before the wrong guesses are stopped: this one is not wrong.
+        let same_units = claim_same_units(dm, &req, &key, &stamp);
         cancel_wrong_guess(dm, &key, &session_of(&req));
-        settle_compile_only(dm, &key, &stamp);
+        await_stopped(dm, &key);
+        let t = Instant::now();
+        if let Some(b) = settle_compile_only(dm, &key, &stamp) {
+            waited_for = Some((b, t.elapsed().as_secs_f64()));
+        }
+        if let Some(b) = same_units {
+            log(&format!(
+                "waiting for compile-only prebuild pid {} of the same units",
+                b.pid
+            ));
+            let t = Instant::now();
+            let mut l = b.log.lock().unwrap();
+            while l.exit.is_none() {
+                l = b.cv.wait(l).unwrap();
+            }
+            drop(l);
+            waited_for = Some((b, t.elapsed().as_secs_f64()));
+        }
     }
+    // A prebuild that was stopped or killed left nothing to report.
+    waited_for.take_if(|(b, _)| no_result(b, &b.log.lock().unwrap()));
     let waited_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
     let (build, attached, replayed) = {
         let mut st = dm.state.lock().unwrap();
@@ -1109,6 +1585,7 @@ fn run(dm: &Arc<Daemon>, req: Request, mut s: UnixStream) -> Result<()> {
             .get(&key)
             .filter(|b| {
                 b.stamp.as_deref() == Some(&*stamp)
+                    && !stopped(b)
                     && b.log.lock().unwrap().exit.is_none()
                     && !*b.compile_only.lock().unwrap()
             })
@@ -1121,6 +1598,7 @@ fn run(dm: &Arc<Daemon>, req: Request, mut s: UnixStream) -> Result<()> {
                 b.stamp.as_deref() == Some(&*stamp)
                     && b.started.elapsed() < FINISHED_MAX_AGE
                     && !*b.compile_only.lock().unwrap()
+                    && !no_result(b, &b.log.lock().unwrap())
             })
         };
         remember_request(&mut st, &req, &key, &roots);
@@ -1136,7 +1614,15 @@ fn run(dm: &Arc<Daemon>, req: Request, mut s: UnixStream) -> Result<()> {
                 (b, true, replayed)
             }
             _ => {
-                let b = start(&req, Some(stamp), &cwd)?;
+                // The run that follows a prebuild of its units finds them
+                // Fresh: tell it whose work that was.
+                let waited = waited_for
+                    .as_ref()
+                    .and_then(|(b, secs)| waited_env(b.run_id.as_deref(), *secs));
+                let mut told = req.clone();
+                told.env.retain(|(k, _)| k != WAITED_ENV);
+                told.env.extend(waited.map(|v| (WAITED_ENV.to_owned(), v)));
+                let b = start(&told, Some(stamp), &cwd)?;
                 st.builds.insert(key.clone(), b.clone());
                 let (dm2, key2, b2) = (dm.clone(), key.clone(), b.clone());
                 std::thread::spawn(move || reap(&dm2, &key2, &b2));
@@ -1145,7 +1631,7 @@ fn run(dm: &Arc<Daemon>, req: Request, mut s: UnixStream) -> Result<()> {
         }
     };
     serve_build(
-        dm, &req, &roots, &mut s, build, attached, replayed, t0, scan_ms, waited_ms,
+        dm, &req, &roots, &mut s, build, attached, replayed, t0, scan, waited_ms,
     )
 }
 
@@ -1195,12 +1681,14 @@ fn wrong_guess_candidate(build_key: &str, b: &Build, key: &str, session: &str) -
 
 fn remember_request(st: &mut State, req: &Request, key: &str, roots: &[PathBuf]) {
     if !req.prebuild && wants_prebuild(req) {
+        let seen = st.recent.get(key).map_or(1, |r| r.seen.saturating_add(1));
         st.recent.insert(
             key.to_owned(),
             Recent {
                 req: req.clone(),
                 roots: roots.to_vec(),
                 used: Instant::now(),
+                seen,
                 budget: PREBUILDS_PER_REQUEST,
             },
         );
@@ -1218,7 +1706,7 @@ fn serve_build(
     attached: bool,
     replayed: bool,
     t0: Instant,
-    scan_ms: f64,
+    (scan_ms, scan_files): (f64, usize),
     waited_ms: f64,
 ) -> Result<()> {
     let lookup_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1245,7 +1733,7 @@ fn serve_build(
         return Ok(());
     }
     log(&format!(
-        "{} {} in {} ({:.1} ms lookup, {:.1} ms source validation, {:.1} ms prebuild coordination, stamp {})",
+        "{} {} in {} ({:.1} ms lookup, {:.1} ms source validation of {} files, {:.1} ms prebuild coordination, stamp {})",
         if replayed {
             "replay"
         } else if attached {
@@ -1257,6 +1745,7 @@ fn serve_build(
         req.cwd,
         lookup_ms,
         scan_ms,
+        scan_files,
         waited_ms,
         build
             .stamp
@@ -1273,7 +1762,7 @@ fn serve_build(
         // Everyone who asked is gone (killed or timed out): stop the build
         // like their Ctrl+C or kill would have without the daemon.
         log(&format!("no clients left, stopping pid {}", build.pid));
-        crate::sys::terminate_group(build.pid, false);
+        stop(&build);
     }
     res
 }
@@ -1354,6 +1843,11 @@ fn stream(
                 write_msg(s, b'F', b"the prebuild declined to run")?;
                 return Ok(());
             }
+            if stopped(build) {
+                // Its exit code is the daemon's signal, not a verdict.
+                write_msg(s, b'F', b"the build daemon stopped this build")?;
+                return Ok(());
+            }
             let x = Exit {
                 code,
                 attached,
@@ -1412,6 +1906,59 @@ fn peer_closed(s: &UnixStream) -> bool {
     n == 0 || err.is_some_and(|e| e != WSAEWOULDBLOCK)
 }
 
+/// Another prebuild holds the claim.
+#[derive(Debug, PartialEq)]
+struct Busy;
+
+/// The right to prebuild `req`'s command in its directory for its session
+/// (sessions build in separate slots). A daemon runs per client build, so
+/// several see the same edit, and requests that differ only in environment
+/// have separate keys in one daemon: each started the same prebuild and all
+/// but one waited for the build directory (252 of 270 doubled prebuilds on
+/// the hosted machine came from two daemons). The lock dies with its holder.
+/// Fails open: no claim file, no coordination.
+fn prebuild_claim(dir: &Path, req: &Request) -> Result<Option<std::fs::File>, Busy> {
+    let mut h = crate::depcache::H128::new();
+    h.field(req.cwd.as_bytes());
+    for a in &req.argv {
+        h.field(a.as_bytes());
+    }
+    h.field(b"--session--");
+    h.field(session_of(req).as_bytes());
+    let hex = h.hex();
+    let path = dir.join(format!("{}.claim", hex.get(..16).unwrap_or(&hex)));
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    else {
+        return Ok(None);
+    };
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Busy),
+        Err(std::fs::TryLockError::Error(_)) => Ok(None),
+    }
+}
+
+/// A workspace that was deleted (a scratch checkout, a finished CI job):
+/// deleting it wakes the watcher like an edit does, and a prebuild cannot
+/// start in a directory that is gone. Nobody will ask for it again either.
+fn forget_if_gone<V>(recent: &mut HashMap<String, V>, key: &str, cwd: &Path) -> bool {
+    if cwd.is_dir() {
+        return false;
+    }
+    if recent.remove(key).is_some() {
+        log(&format!(
+            "workspace {} is gone, no more prebuilds for it",
+            cwd.display()
+        ));
+    }
+    true
+}
+
 fn start(req: &Request, stamp: Option<String>, cwd: &Path) -> Result<Arc<Build>> {
     let mut c = Command::new(live_exe()?);
     c.args(&req.argv)
@@ -1422,16 +1969,21 @@ fn start(req: &Request, stamp: Option<String>, cwd: &Path) -> Result<Arc<Build>>
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    c.env_remove(STAMP_ENV);
+    if let Some(s) = &stamp {
+        c.env(STAMP_ENV, s);
+    }
     c.detached();
     if req.prebuild {
         // A guess: below every build an agent is waiting for.
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            let nice = warm::niceness(req);
             // SAFETY: setpriority is async-signal-safe.
             unsafe {
-                c.pre_exec(|| {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                c.pre_exec(move || {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
                     Ok(())
                 });
             }
@@ -1451,7 +2003,9 @@ fn start(req: &Request, stamp: Option<String>, cwd: &Path) -> Result<Arc<Build>>
     let b = Arc::new(Build {
         stamp,
         compile_only: Mutex::default(),
+        units_key: Mutex::default(),
         session: session_of(req),
+        cwd: req.cwd.clone(),
         run_id: req
             .env
             .iter()
@@ -1461,6 +2015,8 @@ fn start(req: &Request, stamp: Option<String>, cwd: &Path) -> Result<Arc<Build>>
         finished: Mutex::default(),
         pid: child.id() as i32,
         prebuild: Mutex::new(req.prebuild),
+        stopped: Default::default(),
+        claim: Mutex::default(),
         log: Mutex::default(),
         cv: Condvar::new(),
     });
@@ -1549,7 +2105,7 @@ fn cancel_stale_prebuild(dm: &Daemon, key: &str, stamp: &str) {
         },
         b.pid
     ));
-    crate::sys::terminate_group(b.pid, false);
+    stop(&b);
     let mut l = b.log.lock().unwrap();
     let t = Instant::now();
     while l.exit.is_none() && t.elapsed() < Duration::from_secs(10) {
@@ -1562,6 +2118,83 @@ fn wants_prebuild(req: &Request) -> bool {
     !req.env.iter().any(|(k, v)| {
         k == "JUSTRUST_BUILDD_PREBUILD" && matches!(v.as_str(), "0" | "off" | "false")
     })
+}
+
+fn backoff_duration(misses: u32) -> Duration {
+    match misses {
+        0 => Duration::ZERO,
+        1 => Duration::from_secs(15),
+        2 => Duration::from_secs(60),
+        3 => Duration::from_secs(300),
+        _ => Duration::from_secs(900),
+    }
+}
+
+fn record_prebuild_hit(st: &mut State, cwd: &str) {
+    st.prebuild_backoff.remove(cwd);
+}
+
+fn record_prebuild_miss(st: &mut State, cwd: &str, now: Instant) {
+    let entry = st.prebuild_backoff.entry(cwd.to_owned()).or_default();
+    entry.misses = entry.misses.saturating_add(1);
+    entry.cooldown_until = Some(now + backoff_duration(entry.misses));
+}
+
+fn in_prebuild_cooldown(st: &State, cwd: &str, now: Instant) -> bool {
+    st.prebuild_backoff
+        .get(cwd)
+        .and_then(|b| b.cooldown_until)
+        .is_some_and(|until| now < until)
+}
+
+/// Pick at most one eligible prebuild candidate per workspace (`cwd`),
+/// preferring the most recently used command. Skips workspaces that already
+/// have an in-flight build, are in adaptive backoff cooldown, or haven't
+/// established a real edit-build loop yet (`seen < MIN_REQUESTS_TO_PREBUILD`,
+/// unless explicitly queued by `warm`).
+fn select_prebuild_candidates(
+    st: &State,
+    dirty: &[PathBuf],
+    retry: &[String],
+    queued: &[String],
+    now: Instant,
+) -> Vec<(String, Request, Vec<PathBuf>)> {
+    let mut best_by_cwd: HashMap<&str, (&String, &Recent)> = HashMap::new();
+    for (k, r) in &st.recent {
+        if r.budget == 0 {
+            continue;
+        }
+        let is_queued = queued.contains(k);
+        if !is_queued && r.seen < MIN_REQUESTS_TO_PREBUILD {
+            continue;
+        }
+        if !is_queued && in_prebuild_cooldown(st, &r.req.cwd, now) {
+            continue;
+        }
+        if st.builds.values().any(|b| b.cwd == r.req.cwd) {
+            continue;
+        }
+        let triggered = retry.contains(k)
+            || is_queued
+            || dirty
+                .iter()
+                .any(|d| r.roots.iter().any(|x| d.starts_with(x)));
+        if !triggered {
+            continue;
+        }
+        best_by_cwd
+            .entry(r.req.cwd.as_str())
+            .and_modify(|cur| {
+                if r.used > cur.1.used {
+                    *cur = (k, r);
+                }
+            })
+            .or_insert((k, r));
+    }
+    best_by_cwd
+        .into_values()
+        .map(|(k, r)| (k.clone(), r.req.clone(), r.roots.clone()))
+        .collect()
 }
 
 fn is_test(argv: &[String]) -> bool {
@@ -1588,25 +2221,109 @@ fn no_run_argv(argv: &[String]) -> Vec<String> {
     out
 }
 
+/// `test ARGS [FILTER] [-- LIBTEST ARGS]` -> `test ARGS`: what decides the
+/// units Cargo compiles. `test --lib a::` and `test --lib -- b c` build the
+/// same test binary and differ only in which of its tests run.
+///
+/// An unknown flag is taken to have no value. If it has one, two requests
+/// that differ there count as the same units, and the cost is waiting for a
+/// prebuild that helps less than hoped: the request still runs in full.
+///
+/// Flags that only change what Cargo prints or whether it keeps running
+/// tests are dropped. The test pool compiles with
+/// `test ARGS --no-run --message-format=json-render-diagnostics` before it
+/// runs anything, so every pooled `justrust test` arrives in that form, while
+/// the prebuild guessed from the previous request is `test ARGS --no-run`.
+fn units_argv(argv: &[String]) -> Option<Vec<String>> {
+    if !is_test(argv) {
+        return None;
+    }
+    let mut out = vec!["test".to_owned()];
+    let mut args = argv[1..].iter().take_while(|a| *a != "--");
+    while let Some(a) = args.next() {
+        if a == "--no-run" || !a.starts_with('-') {
+            continue;
+        }
+        if matches!(a.as_str(), "--message-format" | "--color") {
+            args.next();
+            continue;
+        }
+        if a.starts_with("--message-format=")
+            || a.starts_with("--color=")
+            || matches!(
+                a.as_str(),
+                "--no-fail-fast" | "-q" | "--quiet" | "-v" | "-vv" | "--verbose"
+            )
+        {
+            continue;
+        }
+        out.push(a.clone());
+        if crate::findings::VALUE_FLAGS.contains(&a.as_str()) {
+            out.extend(args.next().cloned());
+        }
+    }
+    Some(out)
+}
+
+/// [`request_key`] of the units a `test` request compiles, whatever it runs.
+fn units_key(req: &Request) -> Option<String> {
+    let mut same = req.clone();
+    same.argv = units_argv(&req.argv)?;
+    Some(request_key(&same))
+}
+
+/// A compile-only prebuild for this agent is compiling, from these sources,
+/// the units this request needs, guessed from a request for other tests of
+/// them (`test --lib a::` before `test --lib b::`). Claim it, so that it is
+/// not stopped as a wrong guess: the caller waits for it, and the real run
+/// that follows finds every unit Fresh. Stopping it would discard its
+/// progress and compile the same units again from the start.
+fn claim_same_units(dm: &Daemon, req: &Request, key: &str, stamp: &str) -> Option<Arc<Build>> {
+    let units = units_key(req)?;
+    let session = session_of(req);
+    let st = dm.state.lock().unwrap();
+    let b = st
+        .builds
+        .iter()
+        .find(|(k, b)| {
+            *k != key
+                && b.session == session
+                && b.stamp.as_deref() == Some(stamp)
+                && *b.compile_only.lock().unwrap()
+                && b.units_key.lock().unwrap().as_deref() == Some(&*units)
+                && b.log.lock().unwrap().exit.is_none()
+        })
+        .map(|(_, b)| b.clone())?;
+    b.log.lock().unwrap().claimed = true;
+    Some(b)
+}
+
 /// A compile-only prebuild of this request and these sources is running:
 /// wait for it (the agent's build would wait on its slot anyway), so the
 /// real run that follows finds every unit Fresh. A finished one is dropped.
-fn settle_compile_only(dm: &Daemon, key: &str, stamp: &str) {
-    let b = {
+/// Returns the prebuild of these sources whose units the run will reuse.
+fn settle_compile_only(dm: &Daemon, key: &str, stamp: &str) -> Option<Arc<Build>> {
+    let (done, b) = {
         let mut st = dm.state.lock().unwrap();
-        if st
+        let done = if st
             .finished
             .get(key)
             .is_some_and(|b| *b.compile_only.lock().unwrap())
         {
-            st.finished.remove(key);
-        }
-        st.builds
+            st.finished
+                .remove(key)
+                .filter(|b| b.stamp.as_deref() == Some(stamp))
+        } else {
+            None
+        };
+        let b = st
+            .builds
             .get(key)
-            .filter(|b| b.stamp.as_deref() == Some(&*stamp) && *b.compile_only.lock().unwrap())
-            .cloned()
+            .filter(|b| b.stamp.as_deref() == Some(stamp) && *b.compile_only.lock().unwrap())
+            .cloned();
+        (done, b)
     };
-    let Some(b) = b else { return };
+    let Some(b) = b else { return done };
     b.log.lock().unwrap().claimed = true;
     log(&format!("waiting for compile-only prebuild pid {}", b.pid));
     let mut l = b.log.lock().unwrap();
@@ -1619,6 +2336,8 @@ fn settle_compile_only(dm: &Daemon, key: &str, stamp: &str) {
     if st.builds.get(key).is_some_and(|x| Arc::ptr_eq(x, &b)) {
         st.builds.remove(key);
     }
+    drop(st);
+    Some(b)
 }
 
 fn session_of(req: &Request) -> String {
@@ -1645,9 +2364,35 @@ fn cancel_wrong_guess(dm: &Daemon, key: &str, session: &str) {
             "agent asked for another build, stopping prebuild pid {}",
             b.pid
         ));
-        crate::sys::terminate_group(b.pid, false);
+        stop(&b);
     }
 }
+
+/// A build of this request that the daemon stopped has not exited yet. It
+/// still holds the slot and the target directory, and its exit is not a
+/// result: wait for it to go, then the request starts its own build.
+fn await_stopped(dm: &Daemon, key: &str) {
+    let dying = {
+        let st = dm.state.lock().unwrap();
+        st.builds.get(key).filter(|b| stopped(b)).cloned()
+    };
+    let Some(b) = dying else { return };
+    log(&format!("waiting for stopped build pid {} to exit", b.pid));
+    let mut l = b.log.lock().unwrap();
+    let t = Instant::now();
+    while l.exit.is_none() && t.elapsed() < STOP_WAIT {
+        l = b.cv.wait_timeout(l, Duration::from_millis(100)).unwrap().0;
+    }
+    drop(l);
+    // `reap` forgets it; make sure it is gone before `key` is looked up.
+    let mut st = dm.state.lock().unwrap();
+    if st.builds.get(key).is_some_and(|x| Arc::ptr_eq(x, &b)) {
+        st.builds.remove(key);
+    }
+}
+
+/// How long a request waits for a build the daemon stopped to exit.
+const STOP_WAIT: Duration = Duration::from_secs(10);
 
 fn prune_recent(recent: &mut HashMap<String, Recent>) {
     recent.retain(|_, r| r.used.elapsed() < RECENT_MAX_AGE);
@@ -1724,22 +2469,24 @@ fn prebuild_loop(dm: &Arc<Daemon>, rx: std::sync::mpsc::Receiver<PathBuf>) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
+        // Queued by `warm`: prebuilt whatever the watcher saw.
+        let queued = dm.warm.take_ready();
         let wanted: Vec<(String, Request, Vec<PathBuf>)> = {
             let mut st = dm.state.lock().unwrap();
+            let now = Instant::now();
             prune_recent(&mut st.recent);
-            st.finished
-                .retain(|_, b| b.started.elapsed() < FINISHED_MAX_AGE);
-            st.recent
-                .iter()
-                .filter(|(k, r)| {
-                    r.budget > 0
-                        && (retry.contains(k)
-                            || dirty
-                                .iter()
-                                .any(|d| r.roots.iter().any(|x| d.starts_with(x))))
-                })
-                .map(|(k, r)| (k.clone(), r.req.clone(), r.roots.clone()))
-                .collect()
+            let mut expired_cwds = Vec::new();
+            st.finished.retain(|_, b| {
+                let keep = b.started.elapsed() < FINISHED_MAX_AGE;
+                if !keep && *b.prebuild.lock().unwrap() && !b.log.lock().unwrap().claimed {
+                    expired_cwds.push(b.cwd.clone());
+                }
+                keep
+            });
+            for cwd in expired_cwds {
+                record_prebuild_miss(&mut st, &cwd, now);
+            }
+            select_prebuild_candidates(&st, &dirty, &retry, &queued, now)
         };
         dirty.clear();
         retry.clear();
@@ -1749,6 +2496,9 @@ fn prebuild_loop(dm: &Arc<Daemon>, rx: std::sync::mpsc::Receiver<PathBuf>) {
         }
         for (key, mut req, roots) in wanted {
             let cwd = PathBuf::from(&req.cwd);
+            if forget_if_gone(&mut dm.state.lock().unwrap().recent, &key, &cwd) {
+                continue;
+            }
             let (stamp, _) = source_stamp(&roots, &cwd, &req.env);
             // An unclaimed prebuild of older sources is useless now.
             cancel_stale_prebuild(dm, &key, &stamp);
@@ -1771,6 +2521,7 @@ fn prebuild_loop(dm: &Arc<Daemon>, rx: std::sync::mpsc::Receiver<PathBuf>) {
             // sockets or processes, and a cancelled prebuild would kill
             // them mid-run. Compile the same units only.
             let compile_only = needs_compile_only(&req.argv);
+            let units = compile_only.then(|| units_key(&req)).flatten();
             if compile_only {
                 req.argv = no_run_argv(&req.argv);
             }
@@ -1784,13 +2535,32 @@ fn prebuild_loop(dm: &Arc<Daemon>, rx: std::sync::mpsc::Receiver<PathBuf>) {
             req.env.retain(|(k, _)| k != "JCODE_SESSION_ID");
             req.env.retain(|(k, _)| k != GUESS_ENV);
             req.env.push((GUESS_ENV.into(), "1".into()));
+            if queued.contains(&key) {
+                warm::mark(&mut req);
+            }
+            // One prebuild of a command in a build directory at a time, over
+            // all daemons: wait for the other one, then find its units Fresh.
+            let claim = match dir().map(|d| prebuild_claim(&d.join("prebuild"), &req)) {
+                Ok(Err(Busy)) => {
+                    retry.push(key);
+                    continue;
+                }
+                Ok(Ok(f)) => f,
+                Err(_) => None,
+            };
             match start(&req, Some(stamp), &cwd) {
                 Ok(b) => {
+                    *b.claim.lock().unwrap() = claim;
                     *b.compile_only.lock().unwrap() = compile_only;
+                    *b.units_key.lock().unwrap() = units;
+                    // The pid ties this line to its exit line, the key to
+                    // the request it was guessed from.
                     log(&format!(
-                        "prebuild {} in {} (stamp {})",
+                        "prebuild {} in {} (pid {}, key {}, stamp {})",
                         req.argv.join(" "),
                         req.cwd,
+                        b.pid,
+                        key.get(..8).unwrap_or(&key),
                         b.stamp.as_deref().map(|s| &s[..8]).unwrap_or("native")
                     ));
                     if let Some(r) = st.recent.get_mut(&key) {
@@ -1800,7 +2570,10 @@ fn prebuild_loop(dm: &Arc<Daemon>, rx: std::sync::mpsc::Receiver<PathBuf>) {
                     let (dm2, b2) = (dm.clone(), b.clone());
                     std::thread::spawn(move || reap(&dm2, &key, &b2));
                 }
-                Err(e) => log(&format!("prebuild failed to start: {e:#}")),
+                Err(e) => log(&format!(
+                    "prebuild failed to start in {}: {e:#}",
+                    cwd.display()
+                )),
             }
         }
     }
@@ -1815,17 +2588,24 @@ fn reap(dm: &Daemon, key: &str, b: &Arc<Build>) {
         }
         l.exit
     };
+    // The next prebuild of this command here may start.
+    b.claim.lock().unwrap().take();
     let mut st = dm.state.lock().unwrap();
     if st.builds.get(key).is_some_and(|x| Arc::ptr_eq(x, b)) {
         st.builds.remove(key);
     }
     // Nobody saw it: keep it for the request it was started for.
     let l = b.log.lock().unwrap();
-    let (claimed, early_served) = (l.claimed, l.early_served);
-    let dropped = dropped_guess(b, &l);
+    let (claimed, early_served, sharers) = (l.claimed, l.early_served, l.sharers);
+    let dropped = no_result(b, &l);
     drop(l);
-    if b.stamp.is_some() && !dropped && ((!claimed && *b.prebuild.lock().unwrap()) || early_served)
-    {
+    let was_prebuild = *b.prebuild.lock().unwrap();
+    if was_prebuild && (claimed || sharers > 0) {
+        record_prebuild_hit(&mut st, &b.cwd);
+    } else if was_prebuild && !claimed && dropped {
+        record_prebuild_miss(&mut st, &b.cwd, Instant::now());
+    }
+    if b.stamp.is_some() && !dropped && ((!claimed && was_prebuild) || early_served) {
         st.finished.insert(key.to_owned(), b.clone());
     }
     st.last_request = Some(Instant::now());
@@ -1842,6 +2622,79 @@ fn reap(dm: &Daemon, key: &str, b: &Arc<Build>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The stamp before mirrors were recognised, for the paired profile.
+        pub(super) static STAMP_EVERYTHING: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// `justrust local off` on the machine under test.
+        pub(super) static LOCAL_OFF: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    #[test]
+    fn each_build_has_its_own_daemon_socket() {
+        let a = build_stem(&format!("sha256-{}", "ab12".repeat(16)));
+        let b = build_stem(&format!("sha256-{}", "cd34".repeat(16)));
+        assert_eq!(a, "ab12ab12ab12ab12");
+        assert_ne!(a, b);
+        // An unreadable binary has a fresh id per process: one shared name,
+        // and the daemon behind it still refuses clients of another build.
+        assert_eq!(build_stem("unreadable-12-34-0"), "unidentified");
+        assert_eq!(build_stem("sha256-../../etc"), "unidentified");
+        // sun_path holds 108 bytes: a home this deep still fits.
+        let deep = Path::new("/home")
+            .join("u".repeat(48))
+            .join(".justrust/buildd");
+        assert!(deep.join(format!("{a}.sock")).as_os_str().len() < 108);
+    }
+
+    #[test]
+    fn sweep_removes_only_unheld_files_of_other_builds() {
+        let d = std::env::temp_dir().join(format!("jr-buildd-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for f in [
+            "mine.lock",
+            "mine.sock",
+            "gone.lock",
+            "gone.sock",
+            "live.lock",
+            "live.sock",
+            "lock",
+            "sock",
+            "daemon.log",
+        ] {
+            std::fs::write(d.join(f), b"").unwrap();
+        }
+        // A daemon of another build is running: it holds its lock.
+        let live = std::fs::File::open(d.join("live.lock")).unwrap();
+        live.try_lock().unwrap();
+        // Nothing is old enough yet.
+        sweep_stale(&d, &d.join("mine.lock"), Duration::from_secs(3600));
+        assert!(d.join("gone.lock").exists() && d.join("gone.sock").exists());
+        sweep_stale(&d, &d.join("mine.lock"), Duration::ZERO);
+        let mut left: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        // The legacy shared pair belongs to older clients: never touched.
+        assert_eq!(
+            left,
+            [
+                "daemon.log",
+                "live.lock",
+                "live.sock",
+                "lock",
+                "mine.lock",
+                "mine.sock",
+                "sock"
+            ]
+        );
+        drop(live);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     #[cfg(unix)]
@@ -1940,7 +2793,10 @@ mod tests {
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         let roots = source_roots(&cwd);
         let env: Vec<_> = std::env::vars().collect();
-        for sample in 0..5 {
+        // Interleaved: what a mirror's `.justrustignore` saves on this tree.
+        for sample in 0..10 {
+            let everything = sample % 2 == 0;
+            STAMP_EVERYTHING.with(|on| on.set(everything));
             let start = Instant::now();
             let mut last = start;
             let mut timings = std::collections::BTreeMap::<&str, Duration>::new();
@@ -1952,7 +2808,8 @@ mod tests {
                 last = now;
             });
             eprintln!(
-                "stamp-profile sample={sample} files={files} stamp={stamp} total_ms={:.3} phases_ms={:?}",
+                "stamp-profile sample={sample} mirror_rules={} files={files} stamp={stamp} total_ms={:.3} phases_ms={:?}",
+                !everything,
                 start.elapsed().as_secs_f64() * 1000.0,
                 timings
                     .iter()
@@ -1960,6 +2817,7 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        STAMP_EVERYTHING.with(|on| on.set(false));
     }
 
     #[test]
@@ -2041,6 +2899,97 @@ mod tests {
     }
 
     #[test]
+    fn one_prebuild_of_a_command_in_a_directory_at_a_time_across_daemons() {
+        // Hosted runs 20261121-232520069-1051429-pre and
+        // 20261122-072519783-793907-pre: two daemons, same check, same
+        // directory, same instant.
+        let dir = std::env::temp_dir().join(format!("jr-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let req = |argv: &[&str], session: &str, port: &str| Request {
+            build: String::new(),
+            prebuild: true,
+            cwd: "/w".into(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            env: vec![
+                ("JUSTRUST_SLOT_SESSION".into(), session.into()),
+                ("UNRELATED".into(), port.into()),
+            ],
+        };
+        let held = prebuild_claim(&dir, &req(&["check"], "s", "1")).unwrap();
+        assert!(held.is_some());
+        // Another daemon (its own open file), or another key in this one.
+        assert_eq!(
+            prebuild_claim(&dir, &req(&["check"], "s", "2")).err(),
+            Some(Busy)
+        );
+        // Another command, or another session's slot, is not held back.
+        assert!(prebuild_claim(&dir, &req(&["test"], "s", "1")).is_ok());
+        assert!(prebuild_claim(&dir, &req(&["check"], "t", "1")).is_ok());
+        // The holder exited (or died: the lock goes with the file).
+        drop(held);
+        assert!(prebuild_claim(&dir, &req(&["check"], "s", "2")).is_ok());
+        // Nowhere to keep claims: prebuild anyway.
+        let file = dir.join("not-a-directory");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(
+            prebuild_claim(&file, &req(&["check"], "s", "1")).map(|f| f.is_some()),
+            Ok(false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_workspace_is_forgotten_instead_of_prebuilt() {
+        // Hosted daemon log 2026-11-27: 40 "prebuild failed to start: No
+        // such file or directory", after scratch workspaces were removed.
+        let dir = std::env::temp_dir().join(format!("jr-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut recent = HashMap::from([("k".to_string(), 1), ("other".to_string(), 2)]);
+        assert!(!forget_if_gone(&mut recent, "k", &dir));
+        assert_eq!(recent.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(forget_if_gone(&mut recent, "k", &dir));
+        assert_eq!(recent.keys().collect::<Vec<_>>(), ["other"]);
+        // Asked again for the same key: still skipped, nothing left to drop.
+        assert!(forget_if_gone(&mut recent, "k", &dir));
+    }
+
+    #[test]
+    fn the_connection_a_hosted_client_came_in_on_does_not_split_requests() {
+        // Two release jobs, or one client before and after its link dropped:
+        // the same build, so a prebuild of it is attached to, not raced for
+        // the build directory (20261127-002034387-2928 waited 25.8s there).
+        let argv = [
+            "build",
+            "--release",
+            "--target",
+            "aarch64-unknown-linux-musl",
+        ];
+        let first = req(
+            &[
+                ("PATH", "/bin"),
+                ("SSH_CLIENT", "50.189.71.253 34608 22"),
+                ("SSH_CONNECTION", "50.189.71.253 34608 100.64.1.2 22"),
+            ],
+            &argv,
+        );
+        let second = req(
+            &[
+                ("PATH", "/bin"),
+                ("SSH_CLIENT", "20.1.2.3 51022 22"),
+                ("SSH_CONNECTION", "20.1.2.3 51022 100.64.1.2 22"),
+                ("SSH_TTY", "/dev/pts/3"),
+            ],
+            &argv,
+        );
+        assert_eq!(request_key(&first), request_key(&second));
+        assert_eq!(
+            request_key(&first),
+            request_key(&req(&[("PATH", "/bin")], &argv))
+        );
+    }
+
+    #[test]
     fn test_prebuilds_never_run_tests() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
@@ -2066,6 +3015,142 @@ mod tests {
             "--message-format=json-render-diagnostics"
         ])));
         assert!(!needs_compile_only(&v(&["check"])));
+    }
+
+    #[test]
+    fn other_tests_of_the_same_units_share_a_units_key() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let units = |a: &[&str]| units_argv(&v(a));
+        let lib = Some(v(&["test", "-p", "x", "--lib"]));
+        assert_eq!(units(&["test", "-p", "x", "--lib"]), lib);
+        assert_eq!(units(&["test", "-p", "x", "--lib", "fps::"]), lib);
+        assert_eq!(units(&["test", "fps", "-p", "x", "--lib", "--no-run"]), lib);
+        assert_eq!(
+            units(&["test", "-p", "x", "--lib", "--", "a", "b", "--nocapture"]),
+            lib
+        );
+        // A flag's value is not a filter, and what is compiled differs.
+        assert_ne!(units(&["test", "-p", "y", "--lib"]), lib);
+        assert_ne!(units(&["test", "-p", "x"]), lib);
+        assert_ne!(units(&["test", "-p", "x", "--lib", "--release"]), lib);
+        assert_ne!(units(&["test", "--package=x", "--lib"]), lib);
+        assert_eq!(units(&["check", "-p", "x", "--lib"]), None);
+        // The pool's compile request, and other flags that only change what
+        // is printed or whether tests keep running.
+        assert_eq!(
+            units(&[
+                "test",
+                "-p",
+                "x",
+                "--lib",
+                "--no-run",
+                "--message-format=json-render-diagnostics"
+            ]),
+            lib
+        );
+        assert_eq!(
+            units(&[
+                "test",
+                "--message-format",
+                "json",
+                "--color",
+                "never",
+                "-p",
+                "x",
+                "--lib",
+                "-q",
+                "--no-fail-fast",
+                "--color=always"
+            ]),
+            lib
+        );
+
+        let key = |env: &[(&str, &str)], a: &[&str]| units_key(&req(env, a));
+        let base = key(&[("PATH", "/bin")], &["test", "--lib", "a::"]);
+        assert!(base.is_some());
+        assert_eq!(
+            base,
+            key(&[("PATH", "/bin")], &["test", "--lib", "--", "b"])
+        );
+        assert_ne!(
+            base,
+            key(&[("PATH", "/usr/bin")], &["test", "--lib", "a::"])
+        );
+        assert_ne!(base, key(&[("PATH", "/bin")], &["test", "a::"]));
+    }
+
+    #[test]
+    fn a_prebuild_of_the_same_units_is_claimed_not_stopped() {
+        let dm = Daemon {
+            state: Mutex::default(),
+            watcher: None,
+            watched: Mutex::default(),
+            sock: (PathBuf::new(), (0, 0)),
+            exe: None,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            warm: Default::default(),
+        };
+        let env = [("PATH", "/bin"), ("JUSTRUST_SLOT_SESSION", "agent")];
+        let guessed = req(&env, &["test", "--lib", "--", "a::"]);
+        let asked = req(&env, &["test", "--lib", "--", "b::", "c"]);
+        let (guessed_key, asked_key) = (request_key(&guessed), request_key(&asked));
+        assert_ne!(guessed_key, asked_key);
+        let prebuild = |units: Option<String>| {
+            let mut b = fake_build();
+            b.session = "agent".into();
+            *b.prebuild.lock().unwrap() = true;
+            *b.compile_only.lock().unwrap() = true;
+            *b.units_key.lock().unwrap() = units;
+            Arc::new(b)
+        };
+        let insert = |b: &Arc<Build>| {
+            let mut st = dm.state.lock().unwrap();
+            st.builds.clear();
+            st.builds.insert(guessed_key.clone(), b.clone());
+        };
+
+        // Other tests of the same units, same sources: wait for it.
+        let b = prebuild(units_key(&guessed));
+        insert(&b);
+        assert!(wrong_guess_candidate(&guessed_key, &b, &asked_key, "agent"));
+        let claimed = claim_same_units(&dm, &asked, &asked_key, "s").unwrap();
+        assert!(Arc::ptr_eq(&claimed, &b));
+        assert!(!wrong_guess_candidate(
+            &guessed_key,
+            &b,
+            &asked_key,
+            "agent"
+        ));
+
+        // Older sources, other units, another agent, or already over: a
+        // wrong guess as before.
+        let unclaimed = |b: &Arc<Build>, asked: &Request, stamp: &str| {
+            insert(b);
+            let key = request_key(asked);
+            assert!(claim_same_units(&dm, asked, &key, stamp).is_none());
+            assert!(!b.log.lock().unwrap().claimed);
+        };
+        unclaimed(&prebuild(units_key(&guessed)), &asked, "newer");
+        unclaimed(
+            &prebuild(units_key(&guessed)),
+            &req(&env, &["test", "--", "b::"]),
+            "s",
+        );
+        unclaimed(
+            &prebuild(units_key(&guessed)),
+            &req(&env, &["clippy", "--all-targets"]),
+            "s",
+        );
+        unclaimed(&prebuild(None), &asked, "s");
+        let other = prebuild(units_key(&guessed));
+        other.log.lock().unwrap().exit = Some(0);
+        unclaimed(&other, &asked, "s");
+        let mut b = fake_build();
+        b.session = "other".into();
+        *b.prebuild.lock().unwrap() = true;
+        *b.compile_only.lock().unwrap() = true;
+        *b.units_key.lock().unwrap() = units_key(&guessed);
+        unclaimed(&Arc::new(b), &asked, "s");
     }
 
     #[test]
@@ -2204,6 +3289,7 @@ mod tests {
             sock: (PathBuf::new(), (0, 0)),
             exe: None,
             draining: std::sync::atomic::AtomicBool::new(false),
+            warm: Default::default(),
         };
         let mut b = fake_build();
         b.stamp = None;
@@ -2234,6 +3320,7 @@ mod tests {
             sock: (PathBuf::new(), (0, 0)),
             exe: None,
             draining: std::sync::atomic::AtomicBool::new(false),
+            warm: Default::default(),
         });
         let mut owner = fake_build();
         owner.stamp = None;
@@ -2278,6 +3365,7 @@ mod tests {
             sock: (PathBuf::new(), (0, 0)),
             exe: None,
             draining: std::sync::atomic::AtomicBool::new(false),
+            warm: Default::default(),
         };
         let mut old = fake_build();
         old.stamp = None;
@@ -2303,6 +3391,7 @@ mod tests {
             sock: (PathBuf::new(), (0, 0)),
             exe: None,
             draining: std::sync::atomic::AtomicBool::new(false),
+            warm: Default::default(),
         };
         for (code, kept) in [(GUESS_DROPPED, false), (0, true), (101, true)] {
             let b = fake_build();
@@ -2315,16 +3404,186 @@ mod tests {
         }
     }
 
+    fn bare_daemon() -> Daemon {
+        Daemon {
+            state: Mutex::default(),
+            watcher: None,
+            watched: Mutex::default(),
+            sock: (PathBuf::new(), (0, 0)),
+            exe: None,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            warm: Default::default(),
+        }
+    }
+
+    /// The clippy prebuild that a `test` request stopped exited 143; the
+    /// clippy request that followed must build, not get 143 as its result.
+    #[test]
+    fn a_build_the_daemon_stopped_is_never_kept_or_answered() {
+        let dm = bare_daemon();
+        for (prebuild, claimed, code) in [(true, false, 143), (true, true, 0), (false, true, 143)] {
+            let b = fake_build();
+            *b.prebuild.lock().unwrap() = prebuild;
+            {
+                let mut l = b.log.lock().unwrap();
+                l.claimed = claimed;
+                // It answered early, which alone would keep its verdict.
+                l.early_served = true;
+                l.chunks.push((b'E', b"Checking a".to_vec()));
+            }
+            // A fake build has pid 0, which `stop` never signals.
+            stop(&b);
+            b.log.lock().unwrap().exit = Some(code);
+            let b = Arc::new(b);
+            reap(&dm, "key", &b);
+            assert!(dm.state.lock().unwrap().finished.is_empty(), "exit {code}");
+            let frames = client_frames(&b);
+            let (kind, why) = frames.last().unwrap();
+            assert_eq!(*kind, b'F', "exit {code}");
+            assert!(String::from_utf8_lossy(why).contains("stopped"));
+            assert!(frames.iter().all(|(k, _)| *k != b'X'));
+        }
+    }
+
+    #[test]
+    fn a_request_waits_for_a_stopped_build_to_exit_and_never_attaches() {
+        let dm = Arc::new(bare_daemon());
+        let b = Arc::new(fake_build());
+        *b.prebuild.lock().unwrap() = true;
+        dm.state
+            .lock()
+            .unwrap()
+            .builds
+            .insert("key".into(), b.clone());
+        // Running and not stopped: nothing to wait for, it stays attachable.
+        await_stopped(&dm, "key");
+        assert!(dm.state.lock().unwrap().builds.contains_key("key"));
+        stop(&b);
+        let exits = {
+            let b = b.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                b.log.lock().unwrap().exit = Some(143);
+                b.cv.notify_all();
+            })
+        };
+        let t = Instant::now();
+        await_stopped(&dm, "key");
+        assert!(t.elapsed() >= Duration::from_millis(140));
+        assert_eq!(b.log.lock().unwrap().exit, Some(143));
+        // Gone before the request looks its key up: it starts its own build.
+        assert!(dm.state.lock().unwrap().builds.is_empty());
+        exits.join().unwrap();
+    }
+
+    #[test]
+    fn an_unclaimed_prebuild_ended_by_a_signal_is_never_kept() {
+        let dm = bare_daemon();
+        for code in SIGNAL_EXITS {
+            for early in [false, true] {
+                let b = fake_build();
+                *b.prebuild.lock().unwrap() = true;
+                {
+                    let mut l = b.log.lock().unwrap();
+                    l.exit = Some(code);
+                    l.early_served = early;
+                }
+                let b = Arc::new(b);
+                assert!(no_result(&b, &b.log.lock().unwrap()));
+                reap(&dm, "key", &b);
+                let st = dm.state.lock().unwrap();
+                assert!(st.finished.is_empty(), "exit {code}");
+            }
+        }
+        // A compile error or a pass is a result, and so is the build an
+        // agent was attached to when it was interrupted.
+        for (code, claimed) in [(0, false), (101, false), (130, true)] {
+            let b = fake_build();
+            *b.prebuild.lock().unwrap() = true;
+            let mut l = b.log.lock().unwrap();
+            l.exit = Some(code);
+            l.claimed = claimed;
+            assert!(!no_result(&b, &l), "exit {code}");
+        }
+    }
+
+    #[test]
+    fn the_prebuild_a_build_waited_for_is_named_to_it() {
+        let v = waited_env(Some("20261127-001850999-119917-pre"), 3.5304).unwrap();
+        assert_eq!(v, "20261127-001850999-119917-pre 3.530");
+        assert_eq!(
+            parse_waited(&v),
+            Some(("20261127-001850999-119917-pre".into(), 3.53))
+        );
+        // No run id to name, or nothing a record could trust.
+        assert_eq!(waited_env(None, 1.0), None);
+        assert_eq!(waited_env(Some("../x"), 1.0), None);
+        assert_eq!(waited_env(Some("id"), f64::NAN), None);
+        for bad in ["", "id", "id x", "../x 1", "id -1", "id inf", " 1"] {
+            assert_eq!(parse_waited(bad), None, "{bad:?}");
+        }
+        // The note is the daemon's: it never makes two requests differ.
+        let plain = req(&[("PATH", "/bin")], &["test"]);
+        let noted = req(&[("PATH", "/bin"), (WAITED_ENV, "id 1.000")], &["test"]);
+        assert_eq!(request_key(&plain), request_key(&noted));
+    }
+
+    #[test]
+    fn a_finished_or_running_prebuild_of_these_sources_is_reported_as_reused() {
+        let dm = bare_daemon();
+        let pre = |stamp: &str| {
+            let mut b = fake_build();
+            b.stamp = Some(stamp.into());
+            *b.prebuild.lock().unwrap() = true;
+            *b.compile_only.lock().unwrap() = true;
+            b.log.lock().unwrap().exit = Some(0);
+            Arc::new(b)
+        };
+        // Finished before the request: reused, and dropped as before.
+        let done = pre("s");
+        dm.state
+            .lock()
+            .unwrap()
+            .finished
+            .insert("key".into(), done.clone());
+        let got = settle_compile_only(&dm, "key", "s").unwrap();
+        assert!(Arc::ptr_eq(&got, &done));
+        assert!(dm.state.lock().unwrap().finished.is_empty());
+        // Of older sources: dropped, and nothing of it is reused.
+        dm.state
+            .lock()
+            .unwrap()
+            .finished
+            .insert("key".into(), pre("old"));
+        assert!(settle_compile_only(&dm, "key", "s").is_none());
+        assert!(dm.state.lock().unwrap().finished.is_empty());
+        // Still in `builds` when the request arrives: waited for.
+        let running = pre("s");
+        dm.state
+            .lock()
+            .unwrap()
+            .builds
+            .insert("key".into(), running.clone());
+        let got = settle_compile_only(&dm, "key", "s").unwrap();
+        assert!(Arc::ptr_eq(&got, &running));
+        assert!(running.log.lock().unwrap().claimed);
+        assert!(dm.state.lock().unwrap().builds.is_empty());
+    }
+
     fn fake_build() -> Build {
         Build {
             stamp: Some("s".into()),
             compile_only: Mutex::default(),
+            units_key: Mutex::default(),
             session: String::new(),
+            cwd: "/ws".into(),
             run_id: None,
             started: Instant::now(),
             finished: Mutex::default(),
             pid: 0,
             prebuild: Mutex::new(false),
+            stopped: Default::default(),
+            claim: Mutex::default(),
             log: Mutex::default(),
             cv: Condvar::new(),
         }
@@ -2500,6 +3759,227 @@ mod tests {
         let _ = std::fs::remove_dir_all(&t);
     }
 
+    /// A workspace with trees its `.justrustignore` keeps out of the mirror:
+    /// plain files (`vendor/big`, `data`, `gen/notes.txt`), a path dependency
+    /// (`vendor/dep`), a member matched by a pattern (`gen/m`) and a package a
+    /// cargo config patches in (`vendor/patched`). 13 files, 3 of them plain.
+    fn ignored_trees(name: &str, members: &str) -> (PathBuf, PathBuf, Vec<(String, String)>) {
+        let t = std::env::temp_dir().join(format!("jr-buildd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let ws = t.join("ws");
+        let file = |rel: &str, text: &str| {
+            let p = ws.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        file(
+            "Cargo.toml",
+            &format!(
+                "[workspace]\nmembers = [{members}]\n[package]\nname = \"ws\"\n[dependencies]\ndep = {{ path = 'vendor/dep' }}\n"
+            ),
+        );
+        file("src/lib.rs", "");
+        file(".justrustignore", "/vendor/\n/data/\n/gen/\n");
+        file("vendor/big/x.rs", "");
+        file("data/a", "");
+        file("gen/notes.txt", "");
+        file("vendor/dep/Cargo.toml", "[package]\nname = \"dep\"\n");
+        file("vendor/dep/src/lib.rs", "");
+        file("gen/m/Cargo.toml", "[package]\nname = \"m\"\n");
+        file("gen/m/src/lib.rs", "");
+        file("vendor/patched/Cargo.toml", "[package]\nname = \"p\"\n");
+        file("vendor/patched/src/lib.rs", "");
+        file(
+            ".cargo/config.toml",
+            "[patch.crates-io]\np = { path = \"vendor/patched\" }\n",
+        );
+        let home = t.join("cargo-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env = vec![("CARGO_HOME".to_string(), home.display().to_string())];
+        (t, ws, env)
+    }
+
+    fn make_mirror(root: &Path) {
+        let token = root.join(crate::remote_checkpoint::TOKEN_FILE);
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        std::fs::write(token, "token").unwrap();
+    }
+
+    #[test]
+    fn mirror_stamp_leaves_out_only_what_the_build_cannot_see_change() {
+        let (t, ws, env) = ignored_trees("mirror", "\"gen/*\"");
+        let roots = source_roots(&ws);
+        assert_eq!(roots, vec![ws.clone()]);
+        let stamp = || source_stamp(&roots, &ws, &env);
+        let edit = |rel: &str| {
+            let p = ws.join(rel);
+            let mut text = std::fs::read_to_string(&p).unwrap();
+            text.push_str("# edited\n");
+            std::fs::write(p, text).unwrap();
+        };
+
+        // A local checkout: a build reads all of it, so all of it is stamped.
+        let (local, n) = stamp();
+        assert_eq!(n, 13);
+        edit("vendor/big/x.rs");
+        let (local_edited, _) = stamp();
+        assert_ne!(local_edited, local);
+
+        // The same tree as a mirror: the sync never writes the three plain
+        // files, and they are the only ones left out.
+        make_mirror(&ws);
+        let (s0, n) = stamp();
+        assert_eq!(n, 10);
+        assert_eq!(
+            source_stamp_with_sort(
+                &roots,
+                &ws,
+                &env,
+                |_| {},
+                |entries| entries.sort_by(|a, b| a.0.cmp(&b.0))
+            ),
+            (s0.clone(), n)
+        );
+        for rel in ["vendor/big/x.rs", "data/a", "gen/notes.txt"] {
+            edit(rel);
+            assert_eq!(stamp().0, s0, "{rel}");
+        }
+        std::fs::write(ws.join("vendor/big/new.rs"), "").unwrap();
+        assert_eq!(stamp().0, s0);
+
+        // Everything the build compiles still changes the stamp, inside an
+        // excluded tree or not, and so do the rules themselves.
+        let mut last = s0;
+        for rel in [
+            "src/lib.rs",
+            "Cargo.toml",
+            "vendor/dep/src/lib.rs",
+            "vendor/dep/Cargo.toml",
+            "gen/m/src/lib.rs",
+            "vendor/patched/src/lib.rs",
+            ".cargo/config.toml",
+            ".justrustignore",
+        ] {
+            edit(rel);
+            let (next, _) = stamp();
+            assert_ne!(next, last, "{rel}");
+            last = next;
+        }
+        std::fs::write(ws.join("vendor/dep/src/new.rs"), "").unwrap();
+        assert_ne!(stamp().0, last);
+
+        // A rule that goes away brings its tree back: `data/a` and the file
+        // added to the dependency, not `vendor/big`.
+        std::fs::write(ws.join(".justrustignore"), "/vendor/\n/gen/\n").unwrap();
+        assert_eq!(stamp().1, 12);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn mirror_stamp_prunes_nothing_it_cannot_prove_unused() {
+        // A member pattern this does not expand could name any directory.
+        let (t, ws, env) = ignored_trees("mirror-glob", "\"gen/**\"");
+        make_mirror(&ws);
+        let roots = source_roots(&ws);
+        assert_eq!(source_stamp(&roots, &ws, &env).1, 13);
+        let _ = std::fs::remove_dir_all(&t);
+
+        // Nor does a manifest that does not parse say what it depends on.
+        let (t, ws, env) = ignored_trees("mirror-bad", "\"gen/*\"");
+        make_mirror(&ws);
+        std::fs::write(ws.join("gen/m/Cargo.toml"), "[package\n").unwrap();
+        let roots = source_roots(&ws);
+        assert_eq!(source_stamp(&roots, &ws, &env).1, 13);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn mirror_rules_of_the_repository_reach_a_workspace_below_it() {
+        let t = std::env::temp_dir().join(format!("jr-buildd-below-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (repo, home) = (t.join("repo"), t.join("cargo-home"));
+        let ws = repo.join("app");
+        let manifest = "[workspace]\n[package]\nname=\"a\"\n";
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join("fixtures")).unwrap();
+        std::fs::create_dir_all(repo.join("tool/src")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(ws.join("src/lib.rs"), "").unwrap();
+        std::fs::write(ws.join("fixtures/big"), "").unwrap();
+        std::fs::write(repo.join("tool/Cargo.toml"), manifest).unwrap();
+        std::fs::write(repo.join("tool/src/lib.rs"), "").unwrap();
+        std::fs::write(repo.join(".justrustignore"), "/app/fixtures/\n/tool/\n").unwrap();
+        let env = vec![("CARGO_HOME".to_string(), home.display().to_string())];
+        let count = |cwd: &Path| source_stamp(&source_roots(cwd), cwd, &env).1;
+        assert_eq!(count(&ws), 3);
+        make_mirror(&repo);
+        assert_eq!(count(&ws), 2);
+        // A build started inside an excluded tree reads that tree: the sync
+        // mirrors it as a root of its own, and the stamp covers it.
+        assert_eq!(count(&repo.join("tool")), 2);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn checkout_whose_builds_are_all_hosted_is_stamped_like_its_mirror() {
+        let (t, ws, env) = ignored_trees("local-off", "\"gen/*\"");
+        let roots = source_roots(&ws);
+        let stamp = || source_stamp(&roots, &ws, &env);
+        let edit = |rel: &str| {
+            let p = ws.join(rel);
+            let mut text = std::fs::read_to_string(&p).unwrap();
+            text.push_str("# edited\n");
+            std::fs::write(p, text).unwrap();
+        };
+        LOCAL_OFF.with(|on| on.set(true));
+        // Outside git the sync mirrors the whole workspace: all stamped.
+        assert_eq!(stamp().1, 13);
+        // In a repository the mirror follows `.justrustignore`, and so does
+        // the stamp: what no build can read does not change it.
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let (s0, n) = stamp();
+        assert_eq!(n, 10);
+        for rel in ["vendor/big/x.rs", "data/a", "gen/notes.txt"] {
+            edit(rel);
+            assert_eq!(stamp().0, s0, "{rel}");
+        }
+        // What a hosted build compiles does, inside an excluded tree or not.
+        let mut last = s0;
+        for rel in [
+            "src/lib.rs",
+            "vendor/dep/src/lib.rs",
+            "gen/m/src/lib.rs",
+            "vendor/patched/src/lib.rs",
+            ".justrustignore",
+        ] {
+            edit(rel);
+            let (next, _) = stamp();
+            assert_ne!(next, last, "{rel}");
+            last = next;
+        }
+        // A machine that may compile here reads all of it again.
+        LOCAL_OFF.with(|on| on.set(false));
+        assert_eq!(stamp().1, 13);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn member_patterns_expand_within_one_component() {
+        assert!(wildcard("*", "a"));
+        assert!(wildcard("jr-*-sys", "jr-zlib-sys"));
+        assert!(wildcard("a?c", "abc"));
+        assert!(!wildcard("a?c", "ac"));
+        assert!(!wildcard("jr-*", "other"));
+        assert!(wildcard("a*", "a"));
+        assert!(expand_member(Path::new("/x"), "crates/**").is_none());
+        assert!(expand_member(Path::new("/x"), "crates/[ab]").is_none());
+        assert_eq!(
+            expand_member(Path::new("/x"), "./crates/../a"),
+            Some(vec![PathBuf::from("/x/a")])
+        );
+    }
+
     #[test]
     fn exe_replacement_and_deleted_path_are_detected() {
         let dir = std::env::temp_dir().join(format!("jr-buildd-exe-{}", std::process::id()));
@@ -2519,7 +3999,16 @@ mod tests {
         assert_eq!(resolve_live_exe(&deleted), bin);
 
         // Atomic replacement changes inode on disk even if current_exe isn't suffixed.
+        // Without an inode (Windows) only the write time tells them apart: the
+        // size is the same and NTFS hands the renamed file the old creation time.
         std::fs::write(&next, b"v2").unwrap();
+        let written = std::fs::metadata(&bin).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&next)
+            .unwrap()
+            .set_modified(written + Duration::from_secs(2))
+            .unwrap();
         std::fs::rename(&next, &bin).unwrap();
         assert!(exe_is_replaced(Some(&initial), Some(&bin)));
 
@@ -2529,5 +4018,73 @@ mod tests {
         assert_eq!(resolve_live_exe(&deleted), deleted);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prebuild_selection_enforces_loop_cap_and_backoff() {
+        let mut st = State::default();
+        let now = Instant::now();
+        let root = PathBuf::from("/ws");
+        let dirty = vec![PathBuf::from("/ws/src/lib.rs")];
+        let queued: Vec<String> = Vec::new();
+
+        let make_req = |session: &str, argv: &[&str]| Request {
+            build: String::new(),
+            cwd: "/ws".into(),
+            argv: argv.iter().map(|s| (*s).to_owned()).collect(),
+            env: vec![("JUSTRUST_SLOT_SESSION".into(), session.into())],
+            prebuild: false,
+        };
+
+        // 1. Loop detection: first request (seen == 1) does not trigger prebuild.
+        let r_check = make_req("s1", &["check"]);
+        let k_check = request_key(&r_check);
+        remember_request(&mut st, &r_check, &k_check, std::slice::from_ref(&root));
+        assert!(select_prebuild_candidates(&st, &dirty, &[], &queued, now).is_empty());
+
+        // Second request for the same command establishes a loop (seen == 2).
+        remember_request(&mut st, &r_check, &k_check, std::slice::from_ref(&root));
+        let got = select_prebuild_candidates(&st, &dirty, &[], &queued, now);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, k_check);
+
+        // 2. Single-prebuild cap per workspace: two eligible commands in /ws -> only most recent.
+        let r_test = make_req("s2", &["test", "--lib"]);
+        let k_test = request_key(&r_test);
+        remember_request(&mut st, &r_test, &k_test, std::slice::from_ref(&root));
+        remember_request(&mut st, &r_test, &k_test, std::slice::from_ref(&root));
+        st.recent.get_mut(&k_check).unwrap().used = now - Duration::from_secs(10);
+        st.recent.get_mut(&k_test).unwrap().used = now;
+        let got = select_prebuild_candidates(&st, &dirty, &[], &queued, now);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, k_test);
+
+        // In-flight build in /ws blocks any prebuild for /ws.
+        st.builds.insert("active".into(), Arc::new(fake_build()));
+        assert!(select_prebuild_candidates(&st, &dirty, &[], &queued, now).is_empty());
+        st.builds.clear();
+
+        // 3. Adaptive backoff: miss puts workspace in cooldown; hit clears it.
+        record_prebuild_miss(&mut st, "/ws", now);
+        assert!(in_prebuild_cooldown(
+            &st,
+            "/ws",
+            now + Duration::from_secs(5)
+        ));
+        assert!(
+            select_prebuild_candidates(&st, &dirty, &[], &queued, now + Duration::from_secs(5))
+                .is_empty()
+        );
+        assert!(!in_prebuild_cooldown(
+            &st,
+            "/ws",
+            now + Duration::from_secs(20)
+        ));
+        record_prebuild_hit(&mut st, "/ws");
+        assert!(!in_prebuild_cooldown(&st, "/ws", now));
+        assert_eq!(
+            select_prebuild_candidates(&st, &dirty, &[], &queued, now).len(),
+            1
+        );
     }
 }

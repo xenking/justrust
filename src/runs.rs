@@ -12,9 +12,38 @@ pub fn load_index() -> Vec<IndexEntry> {
     let Ok(s) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    s.lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in s
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<IndexEntry>(l).ok())
+    {
+        if seen.insert(entry.id.clone()) {
+            out.push(entry);
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// True if `id` already appears in the tail of `index.jsonl`. Used when an
+/// attached remote run receives the shared run's summary so it does not append
+/// a second index row for the same run id.
+pub(crate) fn index_has_recent_id(path: &std::path::Path, id: &str) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut checked = 0usize;
+    read_recent_entries(&mut f, 1, |e| {
+        if e.id == id {
+            return true;
+        }
+        checked += 1;
+        false
+    })
+    .is_ok_and(|v| !v.is_empty())
+        && checked < usize::MAX
 }
 
 /// The last parseable index entry, reading only the file's tail. The index
@@ -173,11 +202,15 @@ pub fn classify_saved(id: &str) -> Option<crate::failure::Failure> {
 
 pub fn list(limit: usize, here: bool, json: bool, filter: FailFilter) -> Result<()> {
     let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let mut seen = std::collections::HashSet::new();
     let runs = paths::index_file()
         .ok()
         .and_then(|p| std::fs::File::open(p).ok())
         .and_then(|mut f| {
             read_recent_entries(&mut f, limit, |r| {
+                if !seen.insert(r.id.clone()) {
+                    return false;
+                }
                 if here && !r.cwd.starts_with(&cwd) {
                     return false;
                 }
@@ -446,7 +479,9 @@ pub fn render(s: &Summary, dir: &std::path::Path) -> String {
     };
     {
         let f = floor;
-        let ratio = if f.total_secs > 0.0 {
+        // A run ended by a signal did not finish: its wall time is not a
+        // build time to hold against the floor.
+        let ratio = if f.total_secs > 0.0 && !crate::summary::signal_exit(s.exit) {
             format!(" ({:.1}x above theoretical optimal)", s.wall / f.total_secs)
         } else {
             String::new()
@@ -493,6 +528,14 @@ pub fn render(s: &Summary, dir: &std::path::Path) -> String {
         )
     } else if s.tests.failed > 0 {
         format!("exit {} ({} tests failed)", s.exit, s.tests.failed)
+    } else if crate::summary::signal_exit(s.exit) && !s.units.cut.is_empty() {
+        format!(
+            "exit {} (killed while compiling {})",
+            s.exit,
+            s.units.cut.join(", ")
+        )
+    } else if crate::summary::signal_exit(s.exit) {
+        format!("exit {} (killed)", s.exit)
     } else {
         format!("exit {}", s.exit)
     };
@@ -1012,6 +1055,31 @@ mod tail_tests {
                 assert!(report.contains(&labels.join(", ")), "{report}");
             }
         }
+    }
+
+    #[test]
+    fn show_does_not_score_a_killed_run_and_says_what_was_cut() {
+        let missing = std::path::Path::new("/nonexistent/justrust-killed-test");
+        let mut s = Summary {
+            subcommand: "build".into(),
+            exit: 143,
+            wall: 6.0,
+            ..Default::default()
+        };
+        s.units.cut = vec!["justrust".into()];
+        let report = render(&s, missing);
+        assert!(!report.contains("above theoretical optimal"), "{report}");
+        assert!(
+            report.contains("result   exit 143 (killed while compiling justrust)"),
+            "{report}"
+        );
+        s.units.cut.clear();
+        assert!(render(&s, missing).contains("result   exit 143 (killed)"));
+        // A run that ended by itself is still held against its floor.
+        s.exit = 0;
+        let report = render(&s, missing);
+        assert!(report.contains("above theoretical optimal"), "{report}");
+        assert!(report.contains("result   exit 0\n"), "{report}");
     }
 
     #[test]

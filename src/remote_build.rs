@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -107,13 +107,6 @@ const FORWARDED_ENV: &[&str] = &[
     "JUSTRUST_EARLY",
     "JUSTRUST_EARLY_EXPERIMENTAL",
     "JUSTRUST_CANONICAL_WS",
-    // Explicit guest-side experiment. Never forward local native paths.
-    "JUSTRUST_HOSTED_HYBRID",
-    "JUSTRUST_HOSTED_HYBRID_ENGINE",
-    "JUSTRUST_HOSTED_HYBRID_TOOLCHAIN",
-    "JUSTRUST_HOSTED_HYBRID_HOME",
-    // Forward only so the agent can reject unsupported detached preparation.
-    "JUSTRUST_HOSTED_HYBRID_PREWARM",
 ];
 
 /// Keep the allowlist explicit. In particular, a wrapper executable on the
@@ -149,81 +142,10 @@ pub(crate) fn forwarded_env(
     env
 }
 
-/// Native hybrid execution is Unix-only. Other clients retain standard hosted
-/// Cargo semantics, including its required telemetry, even with hybrid controls.
-fn hosted_hybrid_eligible(args: &[String], env: &[(String, String)]) -> bool {
-    #[cfg(unix)]
-    {
-        crate::remote_agent::hosted_hybrid_env(args, env).is_ok_and(|mapped| !mapped.is_empty())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (args, env);
-        false
-    }
-}
-
 #[cfg(test)]
 mod platform_env_tests {
     use super::forwarded_env;
 
-    #[test]
-    fn hosted_hybrid_eligibility_preserves_platform_and_cargo_contracts() {
-        let env: Vec<(String, String)> = [
-            ("JUSTRUST_HOSTED_HYBRID", "ready"),
-            ("JUSTRUST_HOSTED_HYBRID_ENGINE", "/guest/bin/engine"),
-            ("JUSTRUST_HOSTED_HYBRID_TOOLCHAIN", "/guest/toolchain"),
-            ("JUSTRUST_HOSTED_HYBRID_HOME", "/guest/hybrid"),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.into(), value.into()))
-        .collect();
-        for command in ["check", "test"] {
-            assert_eq!(
-                super::hosted_hybrid_eligible(&[command.into()], &env),
-                cfg!(unix)
-            );
-        }
-        for args in [
-            vec!["build"],
-            vec!["test", "--no-run"],
-            vec!["check", "--fetch"],
-        ] {
-            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
-            assert!(!super::hosted_hybrid_eligible(&args, &env));
-        }
-        assert!(!super::hosted_hybrid_eligible(&["check".into()], &[]));
-        assert!(!super::hosted_hybrid_eligible(&["check".into()], &env[..1]));
-    }
-
-    #[test]
-    fn hosted_hybrid_controls_are_separate_from_local_native_paths() {
-        let controls = [
-            "JUSTRUST_HOSTED_HYBRID",
-            "JUSTRUST_HOSTED_HYBRID_ENGINE",
-            "JUSTRUST_HOSTED_HYBRID_TOOLCHAIN",
-            "JUSTRUST_HOSTED_HYBRID_HOME",
-            "JUSTRUST_HOSTED_HYBRID_PREWARM",
-        ];
-        let forwarded = forwarded_env(|key| {
-            (controls.contains(&key)
-                || matches!(
-                    key,
-                    "JUSTRUST_HYBRID"
-                        | "JUSTRUST_NATIVE_ENGINE"
-                        | "JUSTRUST_HYBRID_TOOLCHAIN"
-                        | "JR_ENGINE_HOME"
-                        | "JUSTRUST_HYBRID_PREWARM"
-                ))
-            .then(|| "explicit-value".into())
-        });
-        assert_eq!(forwarded.len(), controls.len());
-        assert!(
-            forwarded
-                .iter()
-                .all(|(key, value)| controls.contains(&key.as_str()) && value == "explicit-value")
-        );
-    }
     #[test]
     fn llvm_provisioning_opt_in_is_not_sdk_license_consent() {
         for value in ["yes", "true", "0", "1; unsafe", ""] {
@@ -287,7 +209,7 @@ pub fn source_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
             .iter()
             .filter_map(|p| p.as_str().map(PathBuf::from))
             .collect();
-        if !roots.is_empty() && roots.iter().all(|r| r.is_dir()) {
+        if !roots.is_empty() && roots.iter().all(|r| r.is_dir()) && mirrors(&roots, cwd) {
             return Ok(roots);
         }
     }
@@ -321,23 +243,29 @@ pub fn source_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
     let m: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     let mut dirs = BTreeSet::new();
     if let Some(ws) = m["workspace_root"].as_str() {
-        dirs.insert(repo_root(Path::new(ws)));
+        let ws = Path::new(ws);
+        dirs.insert(repo_root(ws));
+        dirs.extend(excluded_root(ws));
     }
+    let mut packages = Vec::new();
     for p in m["packages"].as_array().into_iter().flatten() {
         if p["source"].is_null()
             && let Some(manifest) = p["manifest_path"].as_str()
             && let Some(d) = Path::new(manifest).parent()
         {
-            let root = repo_root(d);
-            // Outside git (a tarball, a benchmark snapshot) the crate dir
-            // alone misses its workspace's root manifest and lockfile, which
-            // build scripts and cargo read: mirror the whole workspace.
-            dirs.insert(if root.join(".git").exists() {
-                root
-            } else {
-                workspace_dir(d)
-            });
+            dirs.extend(roots_of(d));
+            packages.push(d.to_path_buf());
         }
+    }
+    // Files the sources reach by path (`#[path]`, `include!`) from outside
+    // every root, and those an earlier failed build named as missing.
+    let named = packages
+        .iter()
+        .flat_map(|d| crate::remote_sync::escaping_source_dirs(d))
+        .chain(learned_dirs(&cache, cwd));
+    let package_roots = outermost(dirs.clone());
+    for dir in named {
+        dirs.extend(outside_root(&package_roots, &dir));
     }
     let roots = outermost(dirs);
     if let Some(key) = cache_key {
@@ -345,10 +273,101 @@ pub fn source_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| serde_json::json!({}));
+        // Entries no build can ask for again: other key schemes, and this
+        // workspace under lockfiles that have changed since.
+        if let (Some(entries), Some((workspace, _))) = (v.as_object_mut(), key.split_once('|')) {
+            entries.retain(|k, _| {
+                k.starts_with("v4:") && k.split_once('|').is_none_or(|(w, _)| w != workspace)
+            });
+        }
         v[key] = serde_json::json!(roots);
         let _ = std::fs::write(&cache, v.to_string());
     }
     Ok(roots)
+}
+
+/// A root for `dir`, which holds a source file named by path, when no root
+/// in `roots` mirrors it. None for an ancestor of a root: one stray
+/// `../../x.rs` must not mirror a home directory. That build still fails on
+/// the machine, naming the file.
+fn outside_root(roots: &[PathBuf], dir: &Path) -> Option<PathBuf> {
+    if !dir.is_dir() || mirrors(roots, dir) || roots.iter().any(|r| r.starts_with(dir)) {
+        return None;
+    }
+    Some(excluded_root(dir).unwrap_or_else(|| dir.to_path_buf()))
+}
+
+fn learned_key(cwd: &Path) -> String {
+    format!("v3:learned|{}", workspace_dir(cwd).display())
+}
+
+fn learned_dirs(cache: &Path, cwd: &Path) -> Vec<PathBuf> {
+    std::fs::read(cache)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get(learned_key(cwd))?.as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().map(PathBuf::from))
+        .collect()
+}
+
+/// Files a failed build on the machine could not find or read that exist
+/// here outside every mirrored root: the paths in rustc's "couldn't find
+/// file" and "couldn't read" errors, which are relative to the workspace.
+fn unmirrored_missing(output: &str, cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for marker in ["couldn't find file `", "couldn't read `"] {
+        for rest in output.split(marker).skip(1) {
+            let Some(named) = rest.split('`').next() else {
+                continue;
+            };
+            let found = [workspace_dir(cwd), cwd.to_path_buf()]
+                .iter()
+                .map(|base| crate::remote_sync::lexical_normalize(&base.join(named)))
+                .find(|p| p.is_file());
+            if let Some(file) = found
+                && file.parent().is_some_and(|d| !mirrors(roots, d))
+                && !out.contains(&file)
+            {
+                out.push(file);
+            }
+        }
+    }
+    out
+}
+
+/// After a failed remote build: remember the directories of files it named
+/// as missing that exist here, so the next build mirrors them. Returns the
+/// files that will now be mirrored.
+fn learn_missing(output: &str, cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = unmirrored_missing(output, cwd, roots);
+    files.retain(|f| f.parent().is_some_and(|d| outside_root(roots, d).is_some()));
+    if files.is_empty() {
+        return files;
+    }
+    let Ok(cache) = crate::remote::dir().map(|d| d.join("roots.json")) else {
+        return Vec::new();
+    };
+    let mut v: serde_json::Value = std::fs::read(&cache)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut dirs: BTreeSet<PathBuf> = learned_dirs(&cache, cwd).into_iter().collect();
+    dirs.extend(
+        files
+            .iter()
+            .filter_map(|f| f.parent().map(Path::to_path_buf)),
+    );
+    v[learned_key(cwd)] = serde_json::json!(dirs);
+    // The cached roots predate this: compute them again on the next build.
+    if let (Some(entries), Some(key)) = (v.as_object_mut(), roots_cache_key(cwd)) {
+        entries.remove(&key);
+    }
+    if std::fs::write(&cache, v.to_string()).is_err() {
+        return Vec::new();
+    }
+    files
 }
 
 fn cargo_missing(e: &anyhow::Error) -> bool {
@@ -366,43 +385,93 @@ fn cargo_missing(e: &anyhow::Error) -> bool {
 fn manifest_roots(cwd: &Path) -> Vec<PathBuf> {
     let dirs = crate::buildd::source_roots(cwd)
         .into_iter()
-        .map(|d| {
-            let root = repo_root(&d);
-            if root.join(".git").exists() {
-                root
-            } else {
-                workspace_dir(&d)
-            }
-        })
+        .flat_map(|d| roots_of(&d))
         .collect();
     outermost(dirs)
 }
 
-/// Lockfile path + mtime: path dependencies only change with the lockfile.
-fn roots_cache_key(cwd: &Path) -> Option<String> {
-    let lock = lockfile(cwd)?;
-    let mtime = std::fs::metadata(&lock)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    Some(format!("{}@{mtime}", lock.display()))
+/// The roots to mirror so that the machine has the local package in `d`.
+fn roots_of(d: &Path) -> Vec<PathBuf> {
+    let root = repo_root(d);
+    // Outside git (a tarball, a benchmark snapshot) the crate dir alone
+    // misses its workspace's root manifest and lockfile, which build scripts
+    // and cargo read: mirror the whole workspace.
+    if !root.join(".git").exists() {
+        return vec![workspace_dir(d)];
+    }
+    let mut roots = vec![root];
+    roots.extend(excluded_root(d));
+    roots
 }
 
-/// The outermost Cargo.lock at or above `cwd` (the workspace's).
-pub fn lockfile(cwd: &Path) -> Option<PathBuf> {
+/// A root of its own for `d` when its repository's `.justrustignore` keeps it
+/// out of the repository's mirror.
+///
+/// The ignore file names trees a build of the repository does not read
+/// (here: `/toolchain/`, 95k files). A build started inside one does read
+/// it, and without a root of its own the machine compiled whatever an older
+/// mirror had left there: `justrust check` in `toolchain/cargo` reported
+/// success on three-day-old sources, with "0 files" to sync.
+fn excluded_root(d: &Path) -> Option<PathBuf> {
+    let repo = repo_root(d);
+    let excluded = |p: &Path| {
+        p.strip_prefix(&repo)
+            .is_ok_and(|rel| crate::remote_sync::excluded_from_mirror(&repo, rel))
+    };
+    if !excluded(d) {
+        return None;
+    }
+    // The package's workspace when that is excluded too, so its root manifest
+    // and lockfile travel. Never wider: the rest of the tree stays out.
+    let ws = workspace_dir(d);
+    Some(if excluded(&ws) { ws } else { d.to_path_buf() })
+}
+
+/// Whether one of `roots` holds `d` in its mirror: a root above it whose
+/// `.justrustignore` does not leave it out.
+fn mirrors(roots: &[PathBuf], d: &Path) -> bool {
+    roots.iter().any(|root| holds(root, d))
+}
+
+fn holds(root: &Path, d: &Path) -> bool {
+    d.strip_prefix(root).is_ok_and(|rel| {
+        rel.as_os_str().is_empty() || !crate::remote_sync::excluded_from_mirror(root, rel)
+    })
+}
+
+/// The workspace of `cwd` and every lockfile at or above it with its mtime:
+/// path dependencies only change with a lockfile.
+///
+/// `v3`: the key was the outermost lockfile alone, which a workspace nested
+/// in a repository with a lockfile of its own (`toolchain/cargo` here) shares
+/// with the repository. Whichever built first after that lockfile changed
+/// cached its roots for both, so after a build in the repository a build in
+/// `toolchain/cargo` mirrored the repository only, which excludes
+/// `/toolchain/`, and the machine compiled the sources an older mirror had
+/// left: `justrust test` reported 3 tests passing with "0 files" to sync
+/// while a fourth, new one was never sent.
+fn roots_cache_key(cwd: &Path) -> Option<String> {
+    let mut locks = Vec::new();
     let mut d = Some(cwd);
-    let mut lock = None;
     while let Some(dir) = d {
-        let l = dir.join("Cargo.lock");
-        if l.exists() {
-            lock = Some(l);
+        let lock = dir.join("Cargo.lock");
+        if let Some(hash) = crate::depcache::hash_file_content(&lock) {
+            locks.push(format!(
+                "{}@{}",
+                lock.display(),
+                &hash[..16.min(hash.len())]
+            ));
         }
         d = dir.parent();
     }
-    lock
+    if locks.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "v4:{}|{}",
+        workspace_dir(cwd).display(),
+        locks.join("|")
+    ))
 }
 
 /// The nearest ancestor of `d` (itself included) whose Cargo.toml declares
@@ -431,12 +500,14 @@ fn repo_root(d: &Path) -> PathBuf {
     d.to_path_buf()
 }
 
-/// Drop roots nested inside another root.
+/// Drop roots nested inside another root, unless that root's mirror excludes
+/// them (`excluded_root`).
 fn outermost(dirs: BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    let covers = holds;
     let mut out: Vec<PathBuf> = Vec::new();
     for d in dirs {
-        if !out.iter().any(|o| d.starts_with(o)) {
-            out.retain(|o| !o.starts_with(&d));
+        if !out.iter().any(|o| covers(o, &d)) {
+            out.retain(|o| !covers(&d, o));
             out.push(d);
         }
     }
@@ -506,7 +577,23 @@ fn fetch_release_on_machine(t: &Target) -> bool {
 /// Use the host's asset from the same release, not an unpublished crates.io
 /// package. Source builds still take the existing source-install fallback.
 fn cross_release_install_script(remote_arch: &str, version: Option<&str>) -> Option<String> {
+    release_install_script(remote_arch, version, false)
+}
+
+/// With `keep_fleet_copy` the verified executable is also kept under its
+/// version in [`FLEET_COPIES`], taken before the shared path is replaced so
+/// it is these bytes whoever replaces that path next.
+fn release_install_script(
+    remote_arch: &str,
+    version: Option<&str>,
+    keep_fleet_copy: bool,
+) -> Option<String> {
     let version = version?;
+    let keep = if keep_fleet_copy {
+        keep_fleet_copy_step(version)
+    } else {
+        String::new()
+    };
     let target = match remote_arch {
         "Linux x86_64" => "x86_64-unknown-linux-musl",
         "Linux aarch64" => "aarch64-unknown-linux-musl",
@@ -525,7 +612,7 @@ fn cross_release_install_script(remote_arch: &str, version: Option<&str>) -> Opt
          tar xzf \"$d/{asset}\" -C \"$d\"; \
          f=\"$d/justrust-{target}/justrust\"; \
          [ \"$(\"$f\" --version)\" = {expected_version} ]; \
-         mkdir -p ~/.cargo/bin; chmod +x \"$f\"; \
+         mkdir -p ~/.cargo/bin; chmod +x \"$f\"; {keep}\
          stage=$(mktemp ~/.cargo/bin/.justrust.upload.XXXXXX); \
          mv \"$f\" \"$stage\"; mv \"$stage\" ~/.cargo/bin/justrust",
         url = shell_quote(&url),
@@ -746,7 +833,7 @@ fn install_fleet_release(t: &Target, version: &str) -> bool {
         return false;
     };
     let arch = String::from_utf8_lossy(&arch.stdout).trim().to_string();
-    let Some(script) = cross_release_install_script(&arch, Some(version)) else {
+    let Some(script) = release_install_script(&arch, Some(version), true) else {
         return false;
     };
     t.command()
@@ -839,6 +926,329 @@ fn upload_patch(t: &Target) -> bool {
     child.wait().is_ok_and(|s| s.success()) && wrote
 }
 
+/// What a build waiting in silence for its setup should do next.
+#[derive(Debug, PartialEq, Eq)]
+enum Silence {
+    Quiet,
+    Say,
+    GiveUp,
+}
+
+/// Notices at 10 s, 30 s, 60 s and every minute after. Only `connecting` is
+/// bounded: a sync lock or a first mirror can be long and still be progress,
+/// but a connect that long is a link that is not coming up.
+fn setup_silence(phase: &str, waited: Duration, notices: u32, bound: Option<Duration>) -> Silence {
+    if phase == "connecting" && bound.is_some_and(|b| waited >= b) {
+        return Silence::GiveUp;
+    }
+    let due = match notices {
+        0 => 10,
+        1 => 30,
+        n => 60 * (u64::from(n) - 1),
+    };
+    if waited >= Duration::from_secs(due) {
+        Silence::Say
+    } else {
+        Silence::Quiet
+    }
+}
+
+/// How long a build may sit in `connecting` before it is given back
+/// (`JUSTRUST_REMOTE_CONNECT_TIMEOUT` seconds, 0 for no bound).
+pub(crate) fn connect_bound() -> Option<Duration> {
+    let secs = std::env::var("JUSTRUST_REMOTE_CONNECT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+struct SetupState {
+    phase: String,
+    since: Instant,
+    notices: u32,
+    done: bool,
+    gave_up: Option<u64>,
+}
+
+/// Says on stderr that a build is still waiting for its setup, and what for.
+///
+/// Setup phases went only to the live status file. On 2026-11-27 builds sat
+/// up to 25 minutes at `justrust: remote` with nothing printed while the
+/// daemon reinstalled and reconnected over a failing link (one connect took
+/// 427 s, eleven builds queued behind it for up to 482 s).
+struct SetupWatch(Arc<(Mutex<SetupState>, Condvar)>);
+
+impl SetupWatch {
+    fn start(sock: Option<crate::sys::net::UnixStream>) -> SetupWatch {
+        let shared = Arc::new((
+            Mutex::new(SetupState {
+                phase: "waiting for the sync daemon".into(),
+                since: Instant::now(),
+                notices: 0,
+                done: false,
+                gave_up: None,
+            }),
+            Condvar::new(),
+        ));
+        let watch = shared.clone();
+        let bound = connect_bound();
+        let _ = std::thread::Builder::new()
+            .name("remote-setup-watch".into())
+            .spawn(move || {
+                let (lock, cv) = &*watch;
+                let mut st = lock.lock().unwrap();
+                while !st.done {
+                    st = cv.wait_timeout(st, Duration::from_secs(1)).unwrap().0;
+                    if st.done {
+                        break;
+                    }
+                    let waited = st.since.elapsed();
+                    match setup_silence(&st.phase, waited, st.notices, bound) {
+                        Silence::Quiet => {}
+                        Silence::Say => {
+                            st.notices += 1;
+                            eprintln!(
+                                "justrust remote: still {} after {}s (`justrust remote status`; JUSTRUST_REMOTE_CONNECT_TIMEOUT bounds connecting)",
+                                st.phase,
+                                waited.as_secs()
+                            );
+                        }
+                        Silence::GiveUp => {
+                            st.gave_up = Some(waited.as_secs());
+                            st.done = true;
+                            // Wakes the blocked read: the build is given back.
+                            if let Some(sock) = &sock {
+                                let _ = sock.shutdown(std::net::Shutdown::Both);
+                            }
+                        }
+                    }
+                }
+            });
+        SetupWatch(shared)
+    }
+
+    fn phase(&self, phase: &str) {
+        let mut st = self.0.0.lock().unwrap();
+        if st.phase != phase {
+            st.phase = phase.into();
+            st.since = Instant::now();
+            st.notices = 0;
+        }
+    }
+
+    /// Setup is over: the run started or a result frame arrived.
+    fn done(&self) {
+        self.0.0.lock().unwrap().done = true;
+        self.0.1.notify_all();
+    }
+
+    fn gave_up(&self) -> Option<u64> {
+        self.0.0.lock().unwrap().gave_up
+    }
+}
+
+impl Drop for SetupWatch {
+    fn drop(&mut self) {
+        self.done();
+    }
+}
+
+/// The sha256 of this client's executable when its build id is one.
+fn own_sha() -> Option<String> {
+    let id = crate::remote_daemon::build_id();
+    let sha = id.strip_prefix("sha256-")?;
+    (sha.len() == 64 && sha.bytes().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_owned())
+}
+
+/// Where the machine keeps exact-byte copies of client executables, one
+/// directory per sha256 (created by [`ensure_session_executable`]).
+const OWN_COPIES: &str = "$HOME/.justrust/remote/session-executables";
+
+/// Where the machine keeps the fleet releases it was given, one directory
+/// per version. A fleet client runs its version from here: the shared path
+/// is replaced by every client that installs its own build.
+const FLEET_COPIES: &str = "$HOME/.justrust/remote/fleet-executables";
+
+/// Shell word for the executable in `dir` when the machine has it, else the
+/// shared path. Running it marks the copy as in use (see `prune_copies`).
+fn copy_or_shared(dir: &str) -> String {
+    format!(
+        "\"$(d=\"{dir}\"; b=\"$d/justrust\"; if [ -x \"$b\" ]; then touch \"$d\" 2>/dev/null; else b=\"$HOME/.cargo/bin/justrust\"; fi; echo \"$b\")\""
+    )
+}
+
+/// Shell that removes the copies under `$d` other than `keep` which nothing
+/// has used for two weeks and no process is still running (a durable
+/// session outlives its client).
+fn prune_copies(keep: &str) -> String {
+    format!(
+        "[ ! -d \"$d\" ] || find \"$d\" -mindepth 1 -maxdepth 1 -type d -mtime +14 ! -name {keep} 2>/dev/null | while IFS= read -r o; do \
+           ls -l /proc/[0-9]*/exe 2>/dev/null | grep -qF \"$o/\" || rm -rf \"$o\"; done"
+    )
+}
+
+/// Shell that keeps the verified release executable `$f` under `version`.
+fn keep_fleet_copy_step(version: &str) -> String {
+    format!(
+        "c=\"{FLEET_COPIES}/{version}\"; mkdir -p \"$c\"; cp \"$f\" \"$c/.justrust.new\"; \
+         chmod 500 \"$c/.justrust.new\"; mv -f \"$c/.justrust.new\" \"$c/justrust\"; "
+    )
+}
+
+/// The fleet version an install stamp records, when it records one.
+fn fleet_of_stamp(stamp: &str) -> Option<&str> {
+    let (_, v) = stamp.rsplit_once(" fleet ")?;
+    (!v.is_empty()
+        && v.len() <= 64
+        && v.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c)))
+    .then_some(v)
+}
+
+fn machine_justrust_from(stamp: Option<&str>, sha: Option<&str>) -> String {
+    match stamp.and_then(fleet_of_stamp) {
+        Some(v) => copy_or_shared(&format!("{FLEET_COPIES}/{v}")),
+        None => machine_justrust_for(sha),
+    }
+}
+
+/// Exit 0 when the machine holds fleet release `version` under its name.
+/// Marks it used and prunes the versions nothing uses any more.
+fn fleet_copy_script(version: &str) -> String {
+    format!(
+        "d=\"{FLEET_COPIES}\"; f=\"$d/{version}/justrust\"; \
+         [ ! -L \"$f\" ] && [ -f \"$f\" ] && [ -O \"$f\" ] && [ -x \"$f\" ] && [ \"$(\"$f\" --version 2>/dev/null)\" = {expected} ]; ok=$?; \
+         [ $ok != 0 ] || touch \"$d/{version}\"; \
+         {prune}; \
+         exit $ok",
+        expected = shell_quote(&format!("justrust {version}")),
+        prune = prune_copies(version),
+    )
+}
+
+/// Does the machine already hold this fleet release? Then nothing is
+/// installed and the shared path is left as it is.
+fn fleet_copy_on_machine(t: &Target, version: &str) -> bool {
+    t.command()
+        .arg(fleet_copy_script(version))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn machine_justrust_for(sha: Option<&str>) -> String {
+    match sha {
+        Some(sha) => copy_or_shared(&format!("{OWN_COPIES}/{sha}")),
+        None => "~/.cargo/bin/justrust".into(),
+    }
+}
+
+/// Shell word for this client's justrust on the machine: the fleet release
+/// when that is what the install stamp records, else this client's own
+/// exact-byte copy. Either falls back to the shared `~/.cargo/bin/justrust`
+/// when the machine has no such copy.
+///
+/// There is one shared path and any number of clients. Two versions in use
+/// at once (an installed release and a candidate run by explicit path) each
+/// replaced it for the other, an install per alternation, and whichever ran
+/// second served the first one's artifact requests. A copy named by its
+/// digest is never anyone else's.
+pub fn machine_justrust() -> String {
+    let stamp = crate::remote::dir()
+        .ok()
+        .and_then(|d| std::fs::read_to_string(d.join("remote-justrust")).ok());
+    machine_justrust_from(stamp.as_deref(), own_sha().as_deref())
+}
+
+/// Exit 0 when the machine holds a valid own copy for `sha`. Marks it used,
+/// and removes copies no client has used for two weeks and no process is
+/// still running (a durable session outlives its client).
+fn own_copy_script(sha: &str) -> String {
+    format!(
+        "d=\"{OWN_COPIES}\"; f=\"$d/{sha}/justrust\"; \
+         sha() {{ (sha256sum \"$1\" 2>/dev/null || shasum -a 256 \"$1\" 2>/dev/null) | awk '{{print $1}}'; }}; \
+         [ ! -L \"$f\" ] && [ -f \"$f\" ] && [ -O \"$f\" ] && [ -x \"$f\" ] && [ \"$(sha \"$f\")\" = {sha} ]; ok=$?; \
+         [ $ok != 0 ] || touch \"$d/{sha}\"; \
+         {prune}; \
+         exit $ok",
+        prune = prune_copies(sha),
+    )
+}
+
+/// Does the machine already hold this exact client? Then nothing is
+/// installed: the shared path stays whatever its last installer left.
+fn own_copy_on_machine(t: &Target) -> bool {
+    own_sha().is_some_and(|sha| {
+        t.command()
+            .arg(own_copy_script(&sha))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+/// Does `reply` (the machine's platform, the sha256 of its justrust and its
+/// `--version`, one per line) describe the binary `stamp` says was installed?
+fn stamp_describes(stamp: &str, dest: &str, own: (&str, &str, &str), reply: &str) -> bool {
+    let (own_platform, own_sha, own_version) = own;
+    let mut lines = reply.lines().map(str::trim);
+    let (Some(platform), Some(sha), Some(version)) = (lines.next(), lines.next(), lines.next())
+    else {
+        return false;
+    };
+    let Some(installed) = stamp.strip_prefix(dest).and_then(|s| s.strip_prefix(' ')) else {
+        return false;
+    };
+    match installed.strip_prefix("fleet ") {
+        Some(fleet) => version == format!("justrust {fleet}"),
+        // This client's own bytes, or its release built for another platform.
+        None => sha == own_sha || (platform != own_platform && version == own_version),
+    }
+}
+
+/// After a handshake that got no answer: is the machine's justrust still the
+/// one the stamp records? One short command instead of a reinstall. `None`
+/// when the machine did not answer either, which says nothing about its
+/// binary: a dropped link must not cost an install over that same link.
+pub fn remote_justrust_intact(t: &Target) -> Option<bool> {
+    let stamp = std::fs::read_to_string(crate::remote::dir().ok()?.join("remote-justrust")).ok()?;
+    let out = t
+        .command()
+        .arg(format!(
+            "uname -sm; b={}; \
+             (sha256sum \"$b\" 2>/dev/null || shasum -a 256 \"$b\" 2>/dev/null || echo -) | awk '{{print $1}}'; \
+             \"$b\" --version 2>/dev/null || echo -; echo answered",
+            // A fleet stamp is about the fleet release, wherever it runs from.
+            machine_justrust_from(Some(&stamp), own_sha().as_deref())
+        ))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let reply = String::from_utf8_lossy(&out.stdout);
+    // The last line shows the whole reply arrived, not a cut-off part of it.
+    if !out.status.success() || reply.lines().last().map(str::trim) != Some("answered") {
+        return None;
+    }
+    let exe = crate::procfs::running_executable_path().ok()?;
+    let sha = crate::toolchain::sha256(&exe).ok()?;
+    Some(stamp_describes(
+        &stamp,
+        &t.dest,
+        (
+            &crate::remote::local_platform(),
+            &sha,
+            concat!("justrust ", env!("CARGO_PKG_VERSION")),
+        ),
+        &reply,
+    ))
+}
+
 /// Make sure the machine runs this exact justrust binary. Same OS and
 /// architecture (the common case): fetch it from its release on the
 /// machine, else copy it. Otherwise build it there from crates.io at this
@@ -855,6 +1265,15 @@ pub fn ensure_remote_justrust(t: &Target) -> Result<()> {
             return Ok(());
         }
         let t0 = Instant::now();
+        if fleet_copy_on_machine(t, v) {
+            std::fs::write(&stamp, want)?;
+            crate::remote::log_event(&format!(
+                "fleet justrust {v} already on {}, nothing installed ({:.1}s)",
+                t.dest,
+                t0.elapsed().as_secs_f64()
+            ));
+            return Ok(());
+        }
         if install_fleet_release(t, v) {
             ensure_wild(t);
             std::fs::write(&stamp, want)?;
@@ -874,6 +1293,17 @@ pub fn ensure_remote_justrust(t: &Target) -> Result<()> {
     let id = crate::remote_daemon::build_id();
     let want = format!("{} {id}", t.dest);
     if std::fs::read_to_string(&stamp).ok().as_deref() == Some(want.as_str()) {
+        return Ok(());
+    }
+    let t0 = Instant::now();
+    if own_copy_on_machine(t) {
+        std::fs::write(&stamp, want)?;
+        crate::remote::log_event(&format!(
+            "justrust {} already on {} as its own copy, nothing installed ({:.1}s)",
+            env!("CARGO_PKG_VERSION"),
+            t.dest,
+            t0.elapsed().as_secs_f64()
+        ));
         return Ok(());
     }
     let arch = t
@@ -1784,18 +2214,16 @@ fn run_remote_inner(
         && crate::remote_hosted::creds()
             .ok()
             .is_some_and(|c| c.warm_admit_ready());
-    let pre_sync_handle = if !overlap_admit
+    if !overlap_admit
         && admitted.is_none()
         && remote_backend::load() == Some(remote_backend::Backend::Hosted)
         && !matches!(crate::remote_windows::selected(), Ok(true))
     {
         let pre_roots = roots.clone();
-        Some(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let _ = crate::remote_daemon::pre_sync(&pre_roots);
-        }))
-    } else {
-        None
-    };
+        });
+    }
     if admitted.is_none() {
         if overlap_admit {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1820,9 +2248,6 @@ fn run_remote_inner(
         return Err(RemoteCancelled.into());
     }
     if crate::remote_windows::selected()? {
-        if let Some(h) = pre_sync_handle {
-            let _ = h.join();
-        }
         let hosted_run = admitted.as_mut().expect("windows run admitted above");
         if remote_backend::load() != Some(remote_backend::Backend::Hosted) {
             return infra(format!(
@@ -1877,9 +2302,9 @@ fn run_remote_inner(
         Err(e) => return infra(format!("{e:#}")),
     };
     crate::e2e::mark("daemon_connected");
-    if let Some(h) = pre_sync_handle {
-        let _ = h.join();
-    }
+    // Do not join the speculative PreSync thread here: if it is still holding
+    // the daemon sync lock, RunSync will wait on the lock (attributed to
+    // sync.lock_wait, not unattributed sync: relay) and reuse its PreSyncStamp.
     let mut env = Vec::new();
     env.push((crate::remote_proto::CLIENT_LIVE_CPU.into(), "1".into()));
     env.extend(forwarded_env(|name| std::env::var(name).ok()));
@@ -1913,13 +2338,11 @@ fn run_remote_inner(
     }
     let mut w = BufWriter::new(sock.try_clone()?);
     let mut r = BufReader::new(sock);
+    let setup_watch = SetupWatch::start(r.get_ref().try_clone().ok());
     // Declared after `r` so it clears the registered fd before `r` closes it.
     let _cancel_sock = cancel_signal::ActiveSocket::register(r.get_ref());
     let mut full = vec![sub.to_string()];
     full.extend(args.iter().cloned());
-    // Only an actually native-eligible request may omit Cargo telemetry.
-    // Artifact-delivery fallbacks retain the ordinary missing-summary policy.
-    let hosted_hybrid = hosted_hybrid_eligible(&full, &env);
     let compile_only = crate::remote_artifacts::test_no_run(&full);
     let json_output = full
         .iter()
@@ -2057,6 +2480,12 @@ fn run_remote_inner(
                     return Err(RemoteCancelled.into());
                 }
                 settle_overlap_admit!(true);
+                if let Some(secs) = setup_watch.gave_up() {
+                    diagnostic.failure_kind = "timeout";
+                    return infra(format!(
+                        "timed out connecting to the remote machine after {secs}s (JUSTRUST_REMOTE_CONNECT_TIMEOUT)"
+                    ));
+                }
                 diagnostic.failure_kind = match &failure {
                     Ok(None) => "connection_closed",
                     Err(error) => {
@@ -2072,6 +2501,14 @@ fn run_remote_inner(
                 return Err(RemoteConnectionLost.into());
             }
         };
+        match &frame.0 {
+            Msg::RunState {
+                may_have_started: false,
+                phase: Some(phase),
+                ..
+            } => setup_watch.phase(phase),
+            _ => setup_watch.done(),
+        }
         match frame {
             (
                 Msg::RunState {
@@ -2164,6 +2601,11 @@ fn run_remote_inner(
                 mark(&format!("run files {} KB", data.len() / 1024));
                 run_files = data
             }
+            (Msg::LinkOutage { ms, .. }, _) => {
+                // The daemon's transport dropped and came back under this run.
+                mark(&format!("link outage {ms:.0} ms"));
+                crate::e2e::note("link_outage", ms / 1000.0);
+            }
             (Msg::Exit { code, timing, .. }, summary) => {
                 settle_overlap_admit!(true);
                 diagnostic.exit = Some(code);
@@ -2177,6 +2619,14 @@ fn run_remote_inner(
                     .and_then(|s| s.failure_wire());
                 if let Some(hr) = admitted.as_mut() {
                     hr.finish("done", Some(code), failure.as_ref());
+                }
+                if code != 0 {
+                    for file in learn_missing(&String::from_utf8_lossy(&summary), &cwd, &roots) {
+                        eprintln!(
+                            "justrust remote: {} exists here but was outside the mirrored roots, so the machine did not have it. It is mirrored from the next build on: run this again.",
+                            file.display()
+                        );
+                    }
                 }
                 if compile_only {
                     compile_stdout.finish(&mut so, &mut se, json_output)?;
@@ -2250,13 +2700,7 @@ fn run_remote_inner(
                     timing,
                     total.elapsed().as_secs_f64(),
                 ) {
-                    if hosted_hybrid && summary.is_empty() {
-                        eprintln!(
-                            "justrust remote: hosted hybrid returned no Cargo telemetry; native status is authoritative"
-                        );
-                    } else {
-                        report_remote_failure(sub, diagnostic, total.elapsed().as_secs_f64());
-                    }
+                    report_remote_failure(sub, diagnostic, total.elapsed().as_secs_f64());
                 }
                 eprintln!(
                     "justrust remote: {} on {machine} in {:.1}s (sync {:.0} ms, {files} file{} at build time)",
@@ -2547,6 +2991,9 @@ fn record_remote(
         sync: sync_timing,
         run: run_timing,
     });
+    // The host wrote a waterfall for its own process. Keep what it measured
+    // around cargo before the end-to-end one replaces it.
+    let host_own = crate::e2e::HostOwn::of(s.e2e.as_ref());
     s.e2e = Some(crate::e2e::remote(
         &crate::e2e::marks(),
         crate::e2e::elapsed(),
@@ -2555,12 +3002,17 @@ fn record_remote(
             run: run_timing,
             host_wall: s.wall,
             slot_wait: s.slot.as_ref().map_or(0.0, |slot| slot.join_wait_secs),
+            prebuild_wait: s.prebuild.as_ref().map_or(0.0, |p| p.wait_secs),
+            host_own,
             host_phases: s.phases.clone(),
+            link_outage: crate::e2e::noted("link_outage"),
+            artifacts: crate::e2e::ArtifactTimes::noted(),
         },
     ));
     // Hints are local state: attach them here, not on the remote machine
     // (which mirrors the workspace at the same absolute path).
     crate::split_index::attach(&mut s);
+    let attached = !s.id.is_empty() && s.id != run_id;
     let _ = std::fs::write(
         dir.join("summary.json"),
         serde_json::to_vec_pretty(&s).unwrap_or_default(),
@@ -2568,14 +3020,17 @@ fn record_remote(
     if let (Ok(idx), Ok(line)) = (
         crate::paths::index_file(),
         serde_json::to_string(&s.index_entry()),
-    ) {
+    ) && (!attached || !crate::runs::index_has_recent_id(&idx, &s.id))
+    {
         let _ = crate::paths::append_line(&idx, &line);
     }
     crate::split_index::record(&s);
     crate::split_index::maybe_refresh(&s);
     crate::test_reuse::store(&s, wall);
-    crate::telemetry::record_run(&s, true);
-    crate::export::upload_run(&s);
+    if !attached {
+        crate::telemetry::record_run(&s, true);
+        crate::export::upload_run(&s);
+    }
     crate::telemetry::maybe_spawn_background();
     // The machine printed its own report, which cannot see the client's side
     // of the wait (sync, admission, artifacts) or this machine's history.
@@ -2994,6 +3449,60 @@ mod tests {
             None,
             0.0
         ));
+    }
+
+    #[test]
+    fn attached_remote_run_does_not_duplicate_index_entry() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        let home =
+            std::env::temp_dir().join(format!("justrust-attached-run-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var_os("JUSTRUST_HOME");
+        unsafe { std::env::set_var("JUSTRUST_HOME", &home) };
+        let summary = crate::summary::Summary {
+            id: "20261126-180033110-1442668".into(),
+            subcommand: "test".into(),
+            args: vec!["test".into(), "--lib".into()],
+            cwd: "/tmp/proj".into(),
+            wall: 5.0,
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&summary).unwrap();
+        assert!(record_remote(
+            "20261126-180033110-1442668",
+            &bytes,
+            &[],
+            "hosted",
+            "hosted",
+            10.0,
+            None,
+            None,
+            5.1,
+        ));
+        assert!(record_remote(
+            "20261126-180033989-1442833",
+            &bytes,
+            &[],
+            "hosted",
+            "hosted",
+            10.0,
+            None,
+            None,
+            4.2,
+        ));
+        let index = std::fs::read_to_string(home.join("index.jsonl")).unwrap();
+        assert_eq!(
+            index.lines().count(),
+            1,
+            "attached run must not append a duplicate index line: {index}"
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var("JUSTRUST_HOME", v) },
+            None => unsafe { std::env::remove_var("JUSTRUST_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
     #[test]
     fn ambiguous_submission_never_falls_back_but_confirmed_rejection_can() {
@@ -3430,6 +3939,338 @@ mod tests {
         assert!(!Path::new(&wrong_pin.path).exists());
     }
 
+    /// `sh -c script` with `home` as HOME. A script this process has just
+    /// written cannot be executed while another test thread is between fork
+    /// and exec with the write descriptor still open ("text file busy",
+    /// exit 126): that is this test binary's doing, so it is tried again.
+    #[cfg(unix)]
+    fn sh_at(home: &Path, script: &str) -> std::process::Output {
+        let mut tries = 0;
+        loop {
+            let out = Command::new("sh")
+                .args(["-c", script])
+                .env("HOME", home)
+                .output()
+                .unwrap();
+            tries += 1;
+            if out.status.code() != Some(126) || tries == 100 {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    /// A fleet client (legacy transport) and a client that installs its own
+    /// build share one machine and one shared path.
+    #[test]
+    fn a_fleet_client_and_an_own_build_alternate_without_reinstalling() {
+        let home = std::env::temp_dir().join(format!("jr-fleet-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        let sh = |script: &str| sh_at(&home, script);
+        let shared = home.join(".cargo/bin/justrust");
+        let fleet = "#!/bin/sh\necho justrust 9.9.9\n";
+        let own = "#!/bin/sh\necho justrust 9.9.10-dev\n";
+        let staged = home.join("staged");
+        // What `release_install_script` does once its download is verified.
+        let install_fleet = || {
+            std::fs::write(&staged, fleet).unwrap();
+            crate::sys::set_mode(&staged, 0o755).unwrap();
+            let done = sh(&format!(
+                "set -e; f=\"$HOME/staged\"; {}mv \"$f\" ~/.cargo/bin/justrust",
+                keep_fleet_copy_step("9.9.9")
+            ));
+            assert!(done.status.success(), "{done:?}");
+        };
+        let install_own = || {
+            std::fs::write(&shared, own).unwrap();
+            crate::sys::set_mode(&shared, 0o755).unwrap();
+        };
+        let script = release_install_script("Linux x86_64", Some("9.9.9"), true).unwrap();
+        assert!(script.contains(&keep_fleet_copy_step("9.9.9")));
+        assert!(
+            script.find("fleet-executables").unwrap() < script.find("mv \"$stage\"").unwrap(),
+            "the copy is taken before the shared path is replaced"
+        );
+        assert!(
+            !cross_release_install_script("Linux x86_64", Some("9.9.9"))
+                .unwrap()
+                .contains("fleet-executables")
+        );
+        // One home, the stamp names the last installer.
+        let (fleet_stamp, own_stamp) = ("host:22 fleet 9.9.9", "host:22 sha256-abc");
+        let mut stamp = "";
+        let (mut before, mut after) = (0, 0);
+        for turn in [fleet_stamp, own_stamp, fleet_stamp, own_stamp, fleet_stamp] {
+            if stamp != turn {
+                stamp = turn;
+                if turn == fleet_stamp {
+                    before += 1;
+                    if !sh(&fleet_copy_script("9.9.9")).status.success() {
+                        after += 1;
+                        install_fleet();
+                    }
+                } else {
+                    // No own copy without a durable session: the shared path.
+                    install_own();
+                }
+            }
+            let run = sh(&machine_justrust_from(Some(turn), None));
+            assert_eq!(
+                String::from_utf8_lossy(&run.stdout).trim(),
+                if turn == fleet_stamp {
+                    "justrust 9.9.9"
+                } else {
+                    "justrust 9.9.10-dev"
+                },
+                "each client reaches its own justrust, whoever installed last"
+            );
+        }
+        assert_eq!(
+            (before, after),
+            (3, 1),
+            "fleet installs: every turn before, once now"
+        );
+        // A fleet version the machine was never given is not there, and its
+        // client falls back to the shared path until it is installed.
+        assert!(!sh(&fleet_copy_script("9.9.8")).status.success());
+        let run = sh(&machine_justrust_from(Some("host:22 fleet 9.9.8"), None));
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).trim(),
+            "justrust 9.9.10-dev"
+        );
+        // A copy that is not the version its directory names does not count.
+        let forged = home.join(".justrust/remote/fleet-executables/9.9.8");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(forged.join("justrust"), fleet).unwrap();
+        crate::sys::set_mode(&forged.join("justrust"), 0o500).unwrap();
+        assert!(!sh(&fleet_copy_script("9.9.8")).status.success());
+        assert!(sh(&fleet_copy_script("9.9.9")).status.success());
+        // Only a well-formed fleet stamp selects a fleet copy.
+        assert_eq!(fleet_of_stamp("host:22 fleet 0.1.69"), Some("0.1.69"));
+        assert_eq!(fleet_of_stamp("host:22 sha256-abc"), None);
+        assert_eq!(fleet_of_stamp("host:22 fleet 1.0; rm -rf ~"), None);
+        assert_eq!(fleet_of_stamp("host:22 fleet "), None);
+        assert_eq!(
+            machine_justrust_from(Some("host:22 sha256-abc"), None),
+            "~/.cargo/bin/justrust"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_client_versions_alternate_without_reinstalling() {
+        let home = std::env::temp_dir().join(format!("jr-own-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let copies = home.join(".justrust/remote/session-executables");
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(&copies).unwrap();
+        let sh = |script: &str| sh_at(&home, script);
+        let digest = |body: &str| {
+            use sha2::Digest;
+            sha2::Sha256::digest(body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let shared = home.join(".cargo/bin/justrust");
+        // What an install does on the machine: replace the shared path, and
+        // (session preparation) keep an exact copy under its digest.
+        let install = |body: &str| {
+            std::fs::write(&shared, body).unwrap();
+            crate::sys::set_mode(&shared, 0o755).unwrap();
+            let dir = copies.join(digest(body));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("justrust"), body).unwrap();
+            crate::sys::set_mode(&dir.join("justrust"), 0o500).unwrap();
+        };
+        let (a, b) = ("#!/bin/sh\necho client-a\n", "#!/bin/sh\necho client-b\n");
+        // One home, two clients taking turns: the stamp names the last one.
+        let mut stamp = String::new();
+        let (mut before, mut after) = (0, 0);
+        for body in [a, b, a, b, a, b] {
+            let sha = digest(body);
+            if stamp != sha {
+                before += 1;
+                if !sh(&own_copy_script(&sha)).status.success() {
+                    after += 1;
+                    install(body);
+                }
+                stamp = sha.clone();
+            }
+            // Each client reaches its own bytes, whoever installed last.
+            let run = sh(&format!("{} x", machine_justrust_for(Some(&sha))));
+            assert_eq!(
+                String::from_utf8_lossy(&run.stdout).trim(),
+                if body == a { "client-a" } else { "client-b" }
+            );
+        }
+        assert_eq!(
+            (before, after),
+            (6, 2),
+            "installs: every turn before, once each now"
+        );
+        // The shared path still works, for whatever else calls it.
+        assert!(sh("~/.cargo/bin/justrust").status.success());
+        // A client the machine has never seen falls back to the shared path.
+        let unknown = digest("never installed");
+        assert!(!sh(&own_copy_script(&unknown)).status.success());
+        let run = sh(&format!("{} x", machine_justrust_for(Some(&unknown))));
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "client-b");
+        assert_eq!(machine_justrust_for(None), "~/.cargo/bin/justrust");
+        // A copy whose bytes are not its name is not ours.
+        let forged = copies.join(&unknown);
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(forged.join("justrust"), a).unwrap();
+        crate::sys::set_mode(&forged.join("justrust"), 0o500).unwrap();
+        assert!(!sh(&own_copy_script(&unknown)).status.success());
+        // Copies unused for two weeks go, the one in use stays.
+        std::fs::File::open(copies.join(digest(b)))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(20 * 86400)),
+            )
+            .unwrap();
+        assert!(sh(&own_copy_script(&digest(a))).status.success());
+        assert!(copies.join(digest(a)).join("justrust").exists());
+        assert!(!copies.join(digest(b)).exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_silent_setup_speaks_within_seconds_and_only_connecting_is_bounded() {
+        let s = Duration::from_secs;
+        let bound = Some(s(300));
+        assert_eq!(setup_silence("connecting", s(9), 0, bound), Silence::Quiet);
+        assert_eq!(setup_silence("connecting", s(10), 0, bound), Silence::Say);
+        assert_eq!(setup_silence("connecting", s(11), 1, bound), Silence::Quiet);
+        assert_eq!(setup_silence("connecting", s(30), 1, bound), Silence::Say);
+        assert_eq!(setup_silence("connecting", s(60), 2, bound), Silence::Say);
+        assert_eq!(
+            setup_silence("connecting", s(119), 3, bound),
+            Silence::Quiet
+        );
+        assert_eq!(setup_silence("connecting", s(120), 3, bound), Silence::Say);
+        assert_eq!(
+            setup_silence("connecting", s(300), 6, bound),
+            Silence::GiveUp
+        );
+        assert_eq!(
+            setup_silence("connecting", s(9000), 200, None),
+            Silence::Quiet
+        );
+        // A long lock wait or mirror is announced, never cut off.
+        for phase in ["waiting for sync lock", "syncing", "applying sources"] {
+            assert_eq!(setup_silence(phase, s(10), 0, bound), Silence::Say);
+            assert_eq!(setup_silence(phase, s(1500), 26, bound), Silence::Say);
+            assert_eq!(setup_silence(phase, s(1500), 27, bound), Silence::Quiet);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_connect_past_its_bound_wakes_the_blocked_read() {
+        use std::io::Read;
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let watch = SetupWatch(Arc::new((
+            Mutex::new(SetupState {
+                phase: "connecting".into(),
+                since: Instant::now() - Duration::from_secs(400),
+                notices: 99,
+                done: false,
+                gave_up: None,
+            }),
+            Condvar::new(),
+        )));
+        // The same step the watch thread takes on its bound.
+        {
+            let mut st = watch.0.0.lock().unwrap();
+            assert_eq!(
+                setup_silence(
+                    &st.phase,
+                    st.since.elapsed(),
+                    st.notices,
+                    Some(Duration::from_secs(300))
+                ),
+                Silence::GiveUp
+            );
+            st.gave_up = Some(st.since.elapsed().as_secs());
+            ours.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        let mut byte = [0u8; 1];
+        assert_eq!((&ours).read(&mut byte).unwrap(), 0, "the read returns");
+        assert!(watch.gave_up().is_some_and(|secs| secs >= 400));
+        // A new phase restarts the clock and the notices.
+        watch.phase("syncing");
+        let st = watch.0.0.lock().unwrap();
+        assert!(st.since.elapsed() < Duration::from_secs(5) && st.notices == 0);
+    }
+
+    #[test]
+    fn stamp_survives_unless_the_machine_reports_another_binary() {
+        let own = ("Linux x86_64", "aaaa", "justrust 0.1.68");
+        let reply = |platform: &str, sha: &str, version: &str| {
+            format!("{platform}\n{sha}\n{version}\nanswered\n")
+        };
+        // Fleet stamp: the version decides, whatever the bytes.
+        let fleet = "host:22 fleet 0.1.68";
+        assert!(stamp_describes(
+            fleet,
+            "host:22",
+            own,
+            &reply("Linux x86_64", "bbbb", "justrust 0.1.68")
+        ));
+        assert!(!stamp_describes(
+            fleet,
+            "host:22",
+            own,
+            &reply("Linux x86_64", "aaaa", "justrust 0.1.67")
+        ));
+        // Own build: exact bytes, or this version built for another platform.
+        let mine = "host:22 0.1.68-abc";
+        assert!(stamp_describes(
+            mine,
+            "host:22",
+            own,
+            &reply("Linux x86_64", "aaaa", "justrust 0.1.68")
+        ));
+        assert!(!stamp_describes(
+            mine,
+            "host:22",
+            own,
+            &reply("Linux x86_64", "bbbb", "justrust 0.1.68")
+        ));
+        assert!(stamp_describes(
+            mine,
+            "host:22",
+            own,
+            &reply("Darwin arm64", "bbbb", "justrust 0.1.68")
+        ));
+        assert!(!stamp_describes(
+            mine,
+            "host:22",
+            own,
+            &reply("Darwin arm64", "bbbb", "justrust 0.1.67")
+        ));
+        // No binary there, a stamp for another machine, a short reply.
+        assert!(!stamp_describes(
+            mine,
+            "host:22",
+            own,
+            &reply("Linux x86_64", "-", "-")
+        ));
+        assert!(!stamp_describes(
+            mine,
+            "other:22",
+            own,
+            &reply("Linux x86_64", "aaaa", "justrust 0.1.68")
+        ));
+        assert!(!stamp_describes(mine, "host:22", own, "Linux x86_64\n"));
+    }
+
     #[test]
     fn fleet_install_only_when_not_behind_the_client() {
         assert!(fleet_usable("0.1.0-alpha.21", "0.1.0-alpha.21"));
@@ -3621,11 +4462,183 @@ mod tests {
         );
     }
 
+    /// A workspace inside a tree the repository's `.justrustignore` excludes
+    /// is mirrored as its own root, next to the repository.
+    #[test]
+    fn workspace_inside_an_ignored_tree_gets_its_own_root() {
+        let t = std::env::temp_dir().join(format!("jr-roots-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let repo = t.join("repo");
+        let inner = repo.join("vendor/tool");
+        for d in [
+            repo.join(".git"),
+            repo.join("src"),
+            inner.join("crates/a/src"),
+            repo.join("vendor/member/src"),
+            repo.join("vendorish/src"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(repo.join(".justrustignore"), "/vendor/\n").unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='repo'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join("Cargo.toml"),
+            "[package]\nname='tool'\nversion='0.1.0'\n[workspace]\nmembers=['crates/a']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join("crates/a/Cargo.toml"),
+            "[package]\nname='a'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        // Excluded: its own workspace, not the repository's and not `vendor/`.
+        assert_eq!(excluded_root(&inner), Some(inner.clone()));
+        assert_eq!(excluded_root(&inner.join("crates/a")), Some(inner.clone()));
+        // A member of the repository's workspace under the excluded tree:
+        // itself, since its workspace is the repository.
+        let member = repo.join("vendor/member");
+        assert_eq!(excluded_root(&member), Some(member.clone()));
+        // Not excluded: no root of its own.
+        assert_eq!(excluded_root(&repo), None);
+        assert_eq!(excluded_root(&repo.join("src")), None);
+        assert_eq!(excluded_root(&repo.join("vendorish")), None);
+        let mut roots = roots_of(&inner.join("crates/a"));
+        roots.sort();
+        assert_eq!(roots, vec![repo.clone(), inner.clone()]);
+        // Nested, but the outer mirror does not hold it: both stay.
+        let d: BTreeSet<PathBuf> = [
+            repo.clone(),
+            inner.clone(),
+            inner.join("crates/a"),
+            repo.join("src"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(outermost(d), vec![repo.clone(), inner.clone()]);
+        // The mirrors do not overlap: the repository's scan leaves the tree out.
+        std::fs::write(inner.join("crates/a/src/lib.rs"), "").unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "").unwrap();
+        let outer = crate::remote_sync::scan(&repo).unwrap().files;
+        assert!(outer.contains_key(Path::new("src/lib.rs")));
+        assert!(!outer.keys().any(|p| p.starts_with("vendor")));
+        let nested = crate::remote_sync::scan(&inner).unwrap().files;
+        assert!(nested.contains_key(Path::new("crates/a/src/lib.rs")));
+        assert!(nested.contains_key(Path::new("Cargo.toml")));
+
+        // Cached roots are per workspace: the nested one has a lockfile of
+        // its own below the repository's, and the repository's roots do not
+        // mirror it.
+        std::fs::write(repo.join("Cargo.lock"), "").unwrap();
+        std::fs::write(inner.join("Cargo.lock"), "").unwrap();
+        let key = |d: &Path| roots_cache_key(d).unwrap();
+        assert_ne!(key(&repo), key(&inner));
+        assert_eq!(key(&inner), key(&inner.join("crates/a")));
+        assert!(key(&inner).starts_with(&format!("v4:{}|", inner.display())));
+        // Before the nested workspace has a lockfile, and for a member of the
+        // repository's workspace under the excluded tree, the key is the
+        // repository's: a cached set that leaves the directory out is not
+        // used.
+        assert_eq!(key(&repo), key(&member));
+        let cached = vec![repo.clone()];
+        assert!(mirrors(&cached, &repo));
+        assert!(mirrors(&cached, &repo.join("src")));
+        assert!(!mirrors(&cached, &inner));
+        assert!(!mirrors(&cached, &inner.join("crates/a")));
+        assert!(!mirrors(&cached, &member));
+        assert!(mirrors(
+            &[repo.clone(), inner.clone()],
+            &inner.join("crates/a")
+        ));
+        // Touching mtime without changing contents keeps the same key;
+        // changing the lockfile contents produces a new key.
+        let before = key(&inner);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(inner.join("Cargo.lock"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(before, key(&inner));
+        std::fs::write(inner.join("Cargo.lock"), "version = 4\n").unwrap();
+        assert_ne!(before, key(&inner));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     #[test]
     fn quoting() {
         assert_eq!(shell_quote("-p"), "-p");
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    /// The layout that failed on the machine: a workspace copied outside git
+    /// whose crate names `../shared/x.rs` by `#[path]`.
+    #[test]
+    fn sources_named_by_path_outside_the_roots_get_a_root() {
+        let t = std::env::temp_dir().join(format!("jr-roots-escaping-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let ws = t.join("toolchain/cargo");
+        let krate = ws.join("crates/util");
+        let shared = t.join("toolchain/shared");
+        let data = t.join("toolchain/data");
+        for d in [&krate.join("src"), &shared, &data, &ws.join("target/debug")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(krate.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(shared.join("binding.rs"), "").unwrap();
+        std::fs::write(data.join("table.bin"), "").unwrap();
+        std::fs::write(t.join("toolchain/stray.rs"), "").unwrap();
+        std::fs::write(krate.join("other.rs"), "").unwrap();
+        std::fs::write(
+            krate.join("src/lib.rs"),
+            concat!(
+                "#[path = \"../../../../shared/binding.rs\"]\nmod binding;\n",
+                "static T: &[u8] = include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../../data/table.bin\"));\n",
+                "// include!(\"../../../../commented/out.rs\");\n",
+                "include!(\"../../../../gone/missing.rs\");\n",
+                "include!(\"../other.rs\");\n",
+                "#[path = \"../../../../stray.rs\"]\nmod stray;\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("target/debug/gen.rs"),
+            "include!(\"../../../shared/binding.rs\");\n",
+        )
+        .unwrap();
+        let named = crate::remote_sync::escaping_source_dirs(&krate);
+        let toolchain = t.join("toolchain");
+        assert_eq!(
+            named.iter().collect::<Vec<_>>(),
+            vec![&toolchain, &data, &shared]
+        );
+        // Neither build output nor a nested package is a source of the
+        // workspace root package.
+        assert!(crate::remote_sync::escaping_source_dirs(&ws).is_empty());
+        let roots = vec![ws.clone()];
+        assert_eq!(outside_root(&roots, &shared), Some(shared.clone()));
+        assert_eq!(outside_root(&roots, &data), Some(data.clone()));
+        // Above a root: never widened to it.
+        assert_eq!(outside_root(&roots, &toolchain), None);
+        // Already mirrored.
+        assert_eq!(outside_root(&roots, &krate), None);
+
+        // The same file, learned from the machine's error instead.
+        let error = "error: couldn't find file `crates/util/src/../../../../shared/binding.rs`\n\
+                     error: couldn't read `crates/util/src/../../../../gone/missing.rs`: No such file\n\
+                     error: couldn't read `crates/util/src/../other.rs`: No such file";
+        assert_eq!(
+            unmirrored_missing(error, &krate, &roots),
+            vec![shared.join("binding.rs")]
+        );
+        assert!(unmirrored_missing(error, &krate, &[ws, shared]).is_empty());
+        let _ = std::fs::remove_dir_all(&t);
     }
 }

@@ -37,6 +37,32 @@ pub struct E2e {
     /// Reconstructed from older records (coarser, no client marks).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub derived: bool,
+    /// Where a segment's time went, when its owner measured that. Parts lie
+    /// inside their segment and are not additional wait: they never sum to
+    /// more than it, and what they leave is the segment's unmeasured rest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Part>,
+    /// Raw artifact observations. Host pack may overlap client work, and
+    /// receive contains wire_read + unpack_exposed. Not additive waterfall parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_times: Option<ArtifactTimes>,
+}
+
+/// A measured piece of one segment.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct Part {
+    /// Key of the segment this lies inside (`sync.link`).
+    pub of: String,
+    /// What was measured (`ready`, `receive`).
+    pub what: String,
+    pub secs: f64,
+    /// Payload bytes that crossed the link during this part, when counted.
+    #[serde(default, skip_serializing_if = "is_zero_bytes")]
+    pub bytes: u64,
+}
+
+fn is_zero_bytes(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Lives with the wire protocol (`Flushed`), which is also compiled alone.
@@ -45,6 +71,7 @@ pub use crate::remote_proto::SyncTiming;
 struct Clock {
     origin: Instant,
     marks: Vec<(&'static str, f64)>,
+    notes: Vec<(&'static str, f64)>,
 }
 
 fn clock() -> &'static Mutex<Clock> {
@@ -53,6 +80,7 @@ fn clock() -> &'static Mutex<Clock> {
         Mutex::new(Clock {
             origin: Instant::now(),
             marks: Vec::new(),
+            notes: Vec::new(),
         })
     })
 }
@@ -69,6 +97,29 @@ pub fn mark(name: &'static str) {
         c.marks.retain(|(n, _)| *n != name);
         c.marks.push((name, t));
     }
+}
+
+/// Add `secs` to a duration measured by whoever owns that part of the wait
+/// (the sync daemon, the artifact stream). Repeated names accumulate.
+pub fn note(name: &'static str, secs: f64) {
+    if !secs.is_finite() || secs <= 0.0 {
+        return;
+    }
+    if let Ok(mut c) = clock().lock() {
+        match c.notes.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, total)) => *total += secs,
+            None => c.notes.push((name, secs)),
+        }
+    }
+}
+
+/// Total noted under `name` so far, in seconds.
+pub fn noted(name: &str) -> f64 {
+    clock()
+        .lock()
+        .ok()
+        .and_then(|c| c.notes.iter().find(|(n, _)| *n == name).map(|(_, s)| *s))
+        .unwrap_or(0.0)
 }
 
 /// Seconds since the clock was anchored.
@@ -99,6 +150,7 @@ impl Marks {
 struct Waterfall {
     at: f64,
     segments: Vec<Segment>,
+    parts: Vec<Part>,
 }
 
 impl Waterfall {
@@ -106,6 +158,29 @@ impl Waterfall {
         Self {
             at: 0.0,
             segments: Vec::new(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// Record where `of`'s time went. Parts are scaled down together if
+    /// they claim more than the segment holds, so they stay inside it.
+    fn parts(&mut self, of: &str, parts: &[(&str, f64)]) {
+        let Some(total) = self.segments.iter().find(|s| s.key == of).map(|s| s.secs) else {
+            return;
+        };
+        let clean = |s: f64| if s.is_finite() { s.max(0.0) } else { 0.0 };
+        let sum: f64 = parts.iter().map(|(_, s)| clean(*s)).sum();
+        let scale = if sum > total { total / sum } else { 1.0 };
+        for (what, secs) in parts {
+            let secs = clean(*secs) * scale;
+            if secs > 0.0 {
+                self.parts.push(Part {
+                    of: of.to_owned(),
+                    what: (*what).to_owned(),
+                    secs,
+                    bytes: 0,
+                });
+            }
         }
     }
 
@@ -155,6 +230,8 @@ impl Waterfall {
             segments: self.segments,
             trace: Vec::new(),
             derived,
+            parts: self.parts,
+            artifact_times: None,
         }
     }
 }
@@ -183,6 +260,9 @@ fn split_owned(w: &mut Waterfall, until: Option<f64>, parts: &[(String, f64)], r
 pub fn local(m: &Marks, now: f64, phases: &crate::summary::Phases) -> E2e {
     let mut w = Waterfall::new();
     w.until("client.route", m.get("routed"));
+    // Selecting and leasing the compiler: waits for a toolchain lifecycle
+    // change on this machine, or installs the pinned compiler.
+    w.until("client.toolchain", m.get("toolchain"));
     w.until("client.setup", m.get("cargo_spawn"));
     split_owned(
         &mut w,
@@ -221,7 +301,97 @@ pub struct RemoteTimes {
     pub host_wall: f64,
     /// Identical-request wait inside slots::acquire, before record_baseline.
     pub slot_wait: f64,
+    /// Seconds the build daemon held the request back for a prebuild of its
+    /// units (`Summary::prebuild`), before the host recorder started.
+    pub prebuild_wait: f64,
+    /// What the host's own recorder measured around cargo.
+    pub host_own: HostOwn,
     pub host_phases: crate::summary::Phases,
+    /// Seconds between flush and exit that the daemon's transport to the
+    /// machine was down and being reattached (the build kept running).
+    pub link_outage: f64,
+    /// Where bringing artifacts back went, as the client measured it.
+    pub artifacts: ArtifactTimes,
+}
+
+/// The artifact return as the client's stream reader saw it. Seconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArtifactTimes {
+    /// Request sent until the machine answered: connection and its start.
+    pub connect: f64,
+    /// Client wall waiting for frame headers, not total host encoding work.
+    pub header_wait: f64,
+    /// Receiving and decoding payload bytes (they overlap: decode is streamed).
+    pub receive: f64,
+    /// Sum of host preparation times of completed, spooled payloads.
+    pub pack: Option<f64>,
+    /// Snapshot and encoder startup through first output, not full encoding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_startup: Option<f64>,
+    #[serde(skip_serializing_if = "is_zero_bytes")]
+    pub streamed_full_files: u64,
+    /// Wall spent reading compressed payload from the client stream.
+    pub wire_read: f64,
+    /// Remaining receive wall outside stream reads, excluding verification.
+    pub unpack_exposed: f64,
+    /// Checking each decoded file and moving it into place.
+    pub verify: f64,
+    /// Encoded payload bytes received (what crossed the link).
+    pub bytes: u64,
+}
+
+impl ArtifactTimes {
+    /// What this process noted while fetching (`artifacts.*`).
+    pub fn noted() -> Self {
+        Self {
+            connect: noted("artifacts.connect"),
+            header_wait: noted("artifacts.encode"),
+            receive: noted("artifacts.receive"),
+            pack: Some(noted("artifacts.pack")).filter(|s| *s > 0.),
+            stream_startup: Some(noted("artifacts.stream_startup")).filter(|s| *s > 0.),
+            streamed_full_files: noted("artifacts.streamed_full_files") as u64,
+            wire_read: noted("artifacts.wire_read"),
+            unpack_exposed: noted("artifacts.unpack_exposed"),
+            verify: noted("artifacts.verify"),
+            bytes: noted("artifacts.bytes") as u64,
+        }
+    }
+}
+
+/// The host recorder's time outside cargo, from the waterfall it wrote for
+/// its own process (`local`). All of it lies inside the agent's execute time
+/// and outside the host wall.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HostOwn {
+    /// Selecting and leasing the compiler.
+    pub toolchain: f64,
+    /// Routing, shim, scope and slot, including any identical-build wait.
+    pub setup: f64,
+    /// After cargo: collecting and writing the run.
+    pub report: f64,
+}
+
+impl HostOwn {
+    /// From the summary the host wrote, before its waterfall is replaced by
+    /// the end-to-end one.
+    pub fn of(host: Option<&E2e>) -> Self {
+        let Some(e) = host.filter(|e| !e.derived) else {
+            return Self::default();
+        };
+        let seg = |k: &str| {
+            e.segments
+                .iter()
+                .filter(|s| s.key == k && s.secs.is_finite() && s.secs > 0.0)
+                .map(|s| s.secs)
+                .sum::<f64>()
+        };
+        Self {
+            toolchain: seg("client.toolchain"),
+            setup: seg("client.route") + seg("client.setup"),
+            report: seg("client.report"),
+        }
+    }
 }
 
 /// A hosted or remote build. Marks: `routed`, `remote_roots`, `admitted`,
@@ -250,6 +420,16 @@ pub fn remote(m: &Marks, now: f64, r: &RemoteTimes) -> E2e {
         ),
         None => w.until("sync.total", m.get("flushed")),
     }
+    if let Some(s) = r.sync {
+        w.parts(
+            "sync.link",
+            &[
+                ("ready", s.link_ready_ms / 1000.0),
+                ("install", s.link_install_ms / 1000.0),
+                ("session", s.link_session_ms / 1000.0),
+            ],
+        );
+    }
     let mut host = phase_parts(&r.host_phases, "host");
     let phase_sum: f64 = host.iter().map(|(_, v)| v).sum();
     // Phases sum to the host wall; anything recorded beyond them is "other".
@@ -263,16 +443,80 @@ pub fn remote(m: &Marks, now: f64, r: &RemoteTimes) -> E2e {
             0.0
         };
         host.insert(1, ("host.slot_wait".into(), wait));
+        // The daemon waited before it started the host recorder, so this is
+        // in nobody's phases: it comes out of the same unmarked remainder.
+        let prebuild_wait = if r.prebuild_wait.is_finite() {
+            r.prebuild_wait.clamp(0.0, residual - wait)
+        } else {
+            0.0
+        };
+        host.insert(2, ("host.prebuild_wait".into(), prebuild_wait));
+        // The host recorder measured its own time around cargo. It never
+        // exceeds what the agent saw: scale it into what is left.
+        let own = r.host_own;
+        let setup = (own.setup - wait).max(0.0);
+        let left = residual - wait - prebuild_wait;
+        let known = own.toolchain + setup + own.report;
+        let scale = if known > left && known > 0.0 {
+            left / known
+        } else {
+            1.0
+        };
+        host.insert(3, ("host.toolchain".into(), own.toolchain * scale));
+        host.insert(4, ("host.setup".into(), setup * scale));
+        host.push(("host.report".into(), own.report * scale));
         // This remainder has no start/end marks of its own. Keep the historical
         // key for saved profiles, but do not attribute it to recorder work.
-        host.push(("host.recorder".into(), residual - wait));
+        host.push(("host.recorder".into(), (left - known * scale).max(0.0)));
         host.push(("host.finalize".into(), t.finalize_ms / 1000.0));
         host.push(("host.records".into(), t.records_ms / 1000.0));
     }
+    // An outage is time the client waited with the build still running on
+    // the host: it overlaps host work that finished meanwhile. Only what the
+    // host's own measurements leave unexplained can be the outage.
+    if let Some(exit) = m.get("exit") {
+        let known: f64 = host.iter().map(|(_, v)| v.max(0.0)).sum();
+        let unexplained = (exit - w.at - known).max(0.0);
+        let outage = if r.link_outage.is_finite() {
+            r.link_outage.clamp(0.0, unexplained)
+        } else {
+            0.0
+        };
+        host.push(("remote.link_outage".into(), outage));
+    }
     split_owned(&mut w, m.get("exit"), &host, "remote.host_overhead");
     w.until("remote.artifacts", m.get("artifacts"));
+    let split_stream = r.artifacts.wire_read > 0. || r.artifacts.unpack_exposed > 0.;
+    w.parts(
+        "remote.artifacts",
+        &[
+            ("connect", r.artifacts.connect),
+            ("header_wait", r.artifacts.header_wait),
+            (
+                "receive",
+                if split_stream {
+                    0.
+                } else {
+                    r.artifacts.receive
+                },
+            ),
+            ("wire_read", r.artifacts.wire_read),
+            ("unpack_exposed", r.artifacts.unpack_exposed),
+            ("verify", r.artifacts.verify),
+        ],
+    );
+    if let Some(p) = w
+        .parts
+        .iter_mut()
+        .find(|p| p.of == "remote.artifacts" && matches!(p.what.as_str(), "receive" | "wire_read"))
+    {
+        p.bytes = r.artifacts.bytes;
+    }
     w.until("client.report", Some(now));
     let mut e = w.finish(now, false);
+    if r.artifacts != ArtifactTimes::default() {
+        e.artifact_times = Some(r.artifacts);
+    }
     let mut start = Some(0.);
     for (key, end) in [
         ("client.route", m.get("routed")),
@@ -347,15 +591,20 @@ pub fn label(key: &str) -> &str {
     match key {
         "client.route" => "justrust start, routing",
         "client.roots" => "find source roots",
-        "client.setup" => "toolchain, slot, setup",
+        "client.toolchain" | "host.toolchain" => "compiler selection or install",
+        "client.setup" => "slot, shim, setup",
+        "host.setup" => "host slot, shim, setup",
+        "host.report" => "host collect, report",
         "client.report" => "collect, report",
         "remote.admission" => "hosted admission",
         "remote.preflight" => "hosted maintenance check",
         "remote.daemon_connect" => "sync daemon connect",
         "remote.host_overhead" => "host start, results back",
+        "remote.link_outage" => "connection lost, reattach",
         "host.prepare" => "agent preflight, protection",
         "host.recorder" => "unattributed host execution",
         "host.slot_wait" => "wait for identical build",
+        "host.prebuild_wait" => "wait for prebuild of these units",
         "host.finalize" => "activity finalization, GC",
         "host.records" => "pack, send run records",
         "remote.artifacts" => "artifacts back",
@@ -374,6 +623,22 @@ pub fn label(key: &str) -> &str {
         "build.tail" | "host.tail" => "after build",
         "build.other" | "host.other" => "other",
         k => k,
+    }
+}
+
+/// Human label for a measured part of segment `of`.
+pub fn part_label<'a>(of: &str, what: &'a str) -> &'a str {
+    match (of, what) {
+        ("sync.link", "ready") => "machine ready (lease, ssh)",
+        ("sync.link", "install") => "host client, mirror path",
+        ("sync.link", "session") => "session start, handshake",
+        ("remote.artifacts", "connect") => "request, host answers",
+        ("remote.artifacts", "encode" | "header_wait") => "wait for frame header",
+        ("remote.artifacts", "wire_read") => "payload stream reads",
+        ("remote.artifacts", "unpack_exposed") => "unpack outside reads",
+        ("remote.artifacts", "receive") => "download, decode",
+        ("remote.artifacts", "verify") => "verify, move into place",
+        (_, what) => what,
     }
 }
 
@@ -422,6 +687,43 @@ pub fn render(e: &E2e) -> String {
             pct,
             "█".repeat(bar_n.min(24))
         );
+        for p in e.parts.iter().filter(|p| p.of == s.key && p.secs >= 0.005) {
+            // Stream read time excludes concurrent decode and buffered arrivals,
+            // so bytes per read second is not a network throughput measurement.
+            let size = if p.what == "wire_read" && p.bytes > 0 {
+                format!("  {:.1} MB payload", p.bytes as f64 / 1e6)
+            } else if p.bytes > 0 {
+                let mb = p.bytes as f64 / 1e6;
+                format!("  {mb:.1} MB, {:.1} MB/s", mb / p.secs)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                o,
+                "  {:<6}   {:<24} {:>7.2}s{size}",
+                "",
+                part_label(&p.of, &p.what),
+                p.secs
+            );
+        }
+    }
+    if let Some(pack) = e.artifact_times.and_then(|a| a.pack) {
+        let _ = writeln!(
+            o,
+            "  Host pack (spooled files): {pack:.3}s, may overlap client wait; not added to wall"
+        );
+    }
+    if let Some(a) = e.artifact_times
+        && a.streamed_full_files > 0
+    {
+        let _ = write!(o, "  Streamed full artifacts: {}", a.streamed_full_files);
+        if let Some(s) = a.stream_startup {
+            let _ = write!(
+                o,
+                ", host time to first payload: {s:.3}s (sum, not added to wall)"
+            );
+        }
+        o.push('\n');
     }
     o
 }
@@ -480,6 +782,140 @@ mod tests {
     }
 
     #[test]
+    fn a_reattached_transport_drop_is_its_own_segment_and_never_takes_host_time() {
+        let m = Marks(vec![("flushed", 1.0), ("exit", 40.0)]);
+        let mut r = RemoteTimes {
+            host_wall: 18.0,
+            host_phases: Phases {
+                compile: 18.0,
+                ..Default::default()
+            },
+            link_outage: 20.0,
+            ..Default::default()
+        };
+        let e = remote(&m, 40.0, &r);
+        assert!((sum(&e) - 40.0).abs() < 1e-9, "{e:?}");
+        assert!((get(&e, "host.compile") - 18.0).abs() < 1e-9);
+        assert!((get(&e, "remote.link_outage") - 20.0).abs() < 1e-9);
+        assert!((get(&e, "remote.host_overhead") - 1.0).abs() < 1e-9);
+        // The build ran through most of the drop: only what the host cannot
+        // explain is the outage.
+        r.link_outage = 30.0;
+        let e = remote(&m, 40.0, &r);
+        assert!((get(&e, "host.compile") - 18.0).abs() < 1e-9);
+        assert!((get(&e, "remote.link_outage") - 21.0).abs() < 1e-9);
+        assert_eq!(get(&e, "remote.host_overhead"), 0.0);
+        r.link_outage = f64::NAN;
+        assert_eq!(get(&remote(&m, 40.0, &r), "remote.link_outage"), 0.0);
+    }
+
+    #[test]
+    fn parts_stay_inside_their_segment_and_leave_the_sum_alone() {
+        let m = Marks(vec![("flushed", 4.0), ("exit", 5.0), ("artifacts", 9.0)]);
+        let r = RemoteTimes {
+            sync: Some(SyncTiming {
+                link_ms: 3000.0,
+                push_ms: 1000.0,
+                link_ready_ms: 2000.0,
+                link_install_ms: 300.0,
+                link_session_ms: 500.0,
+                ..Default::default()
+            }),
+            artifacts: ArtifactTimes {
+                connect: 1.0,
+                header_wait: 2.0,
+                receive: 4.0,
+                verify: 1.0,
+                bytes: 6_000_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let e = remote(&m, 9.0, &r);
+        assert!((sum(&e) - 9.0).abs() < 1e-9, "{e:?}");
+        let part = |of: &str, what: &str| {
+            e.parts
+                .iter()
+                .find(|p| p.of == of && p.what == what)
+                .map_or(0.0, |p| p.secs)
+        };
+        assert!((get(&e, "sync.link") - 3.0).abs() < 1e-9);
+        assert!((part("sync.link", "ready") - 2.0).abs() < 1e-9);
+        assert!((part("sync.link", "session") - 0.5).abs() < 1e-9);
+        // 8s claimed inside a 4s segment: scaled together, never beyond it.
+        assert!((get(&e, "remote.artifacts") - 4.0).abs() < 1e-9);
+        assert!((part("remote.artifacts", "receive") - 2.0).abs() < 1e-9);
+        let inside: f64 = e
+            .parts
+            .iter()
+            .filter(|p| p.of == "remote.artifacts")
+            .map(|p| p.secs)
+            .sum();
+        assert!((inside - 4.0).abs() < 1e-9);
+        let shown = render(&e);
+        assert!(shown.contains("machine ready (lease, ssh)"), "{shown}");
+        assert!(shown.contains("download, decode"), "{shown}");
+        // 6 MB in the 2s the scaled part holds.
+        assert!(shown.contains("6.0 MB, 3.0 MB/s"), "{shown}");
+        // Old records and runs that measured nothing carry no parts.
+        let plain = remote(&m, 9.0, &RemoteTimes::default());
+        assert!(plain.parts.is_empty());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("parts"));
+    }
+
+    #[test]
+    fn artifact_observations_round_trip_without_adding_overlapping_work() {
+        let marks = Marks(vec![("exit", 1.), ("artifacts", 5.)]);
+        let raw = ArtifactTimes {
+            header_wait: 0.5,
+            pack: Some(3.75),
+            stream_startup: Some(0.125),
+            streamed_full_files: 2,
+            receive: 3.,
+            wire_read: 2.,
+            unpack_exposed: 1.,
+            verify: 0.5,
+            bytes: 2_000_000,
+            ..Default::default()
+        };
+        let e = remote(
+            &marks,
+            5.,
+            &RemoteTimes {
+                artifacts: raw,
+                ..Default::default()
+            },
+        );
+        let saved = serde_json::to_string(&e).unwrap();
+        let restored: E2e = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.artifact_times, Some(raw));
+        assert_eq!(
+            restored
+                .parts
+                .iter()
+                .filter(|p| p.of == "remote.artifacts")
+                .map(|p| p.secs)
+                .sum::<f64>(),
+            4.
+        );
+        let shown = render(&restored);
+        for label in [
+            "wait for frame header",
+            "payload stream reads",
+            "unpack outside reads",
+            "2.0 MB payload",
+            "3.750s, may overlap",
+            "Streamed full artifacts: 2, host time to first payload: 0.125s",
+        ] {
+            assert!(shown.contains(label), "{shown}");
+        }
+        assert!(!shown.contains("download, decode") && !shown.contains("MB/s"));
+        let old: E2e = serde_json::from_str(r#"{"wall":1,"segments":[{"key":"remote.artifacts","secs":1}],"parts":[{"of":"remote.artifacts","what":"encode","secs":1}]}"#).unwrap();
+        assert!(old.artifact_times.is_none());
+        assert!(render(&old).contains("wait for frame header"));
+    }
+
+    #[test]
     fn remote_waterfall_splits_sync_and_host() {
         let m = Marks(vec![
             ("routed", 0.1),
@@ -497,15 +933,18 @@ mod tests {
                 link_ms: 0.0,
                 push_ms: 300.0,
                 barrier_ms: 70.0,
+                ..Default::default()
             }),
             host_wall: 6.0,
             slot_wait: 0.0,
+            host_own: HostOwn::default(),
             host_phases: Phases {
                 startup: 0.5,
                 compile: 5.0,
                 tail: 0.5,
                 ..Default::default()
             },
+            ..Default::default()
         };
         let e = remote(&m, 10.6, &r);
         assert!((sum(&e) - 10.6).abs() < 1e-9, "{e:?}");
@@ -564,6 +1003,111 @@ mod tests {
         ] {
             assert!((get(&e, key) - expected).abs() < 1e-9, "{key}: {e:?}");
         }
+    }
+
+    #[test]
+    fn host_recorder_time_around_cargo_is_named_not_left_unattributed() {
+        // Replay of 20261125-234725124-1994670-pre: the build waited 11.59s
+        // for a toolchain promotion on the host before selecting its compiler.
+        let marks = Marks(vec![("flushed", 0.2), ("exit", 11.85)]);
+        let host = local(
+            &Marks(vec![
+                ("routed", 0.004),
+                ("toolchain", 11.574),
+                ("record_baseline", 11.58),
+                ("cargo_spawn", 11.582),
+                ("cargo_done", 11.592),
+            ]),
+            11.598,
+            &Phases {
+                startup: 0.009,
+                ..Default::default()
+            },
+        );
+        assert!((get(&host, "client.toolchain") - 11.57).abs() < 1e-9);
+        assert!((get(&host, "client.setup") - 0.008).abs() < 1e-9);
+        assert!((sum(&host) - 11.598).abs() < 1e-9);
+        let mut times = RemoteTimes {
+            host_wall: 0.012,
+            host_own: HostOwn::of(Some(&host)),
+            run: Some(crate::remote_proto::RunTiming {
+                execute_ms: 11600.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let e = remote(&marks, 11.86, &times);
+        assert!((get(&e, "host.toolchain") - 11.57).abs() < 1e-9, "{e:?}");
+        assert!((get(&e, "host.setup") - 0.012).abs() < 1e-9, "{e:?}");
+        assert!((get(&e, "host.report") - 0.006).abs() < 1e-9, "{e:?}");
+        assert!(get(&e, "host.recorder") < 0.001, "{e:?}");
+        assert!(render(&e).contains("compiler selection or install"));
+        let without = remote(
+            &marks,
+            11.86,
+            &RemoteTimes {
+                host_own: HostOwn::default(),
+                ..times.clone()
+            },
+        );
+        assert!((get(&without, "host.recorder") - 11.588).abs() < 1e-9);
+        assert!((sum(&e) - sum(&without)).abs() < 1e-9);
+
+        // The identical-build wait happens inside the host's setup: it is not
+        // counted twice.
+        times.slot_wait = 0.005;
+        let e = remote(&marks, 11.86, &times);
+        assert!((get(&e, "host.slot_wait") - 0.005).abs() < 1e-9);
+        assert!((get(&e, "host.setup") - 0.007).abs() < 1e-9);
+
+        // The daemon's wait for a prebuild of these units is named, out of
+        // the remainder nobody marked: the whole stays the same, and it
+        // never exceeds what is left.
+        let mut waited = RemoteTimes {
+            host_own: HostOwn::default(),
+            prebuild_wait: 3.53,
+            ..times.clone()
+        };
+        let e = remote(&marks, 11.86, &waited);
+        assert!((get(&e, "host.prebuild_wait") - 3.53).abs() < 1e-9);
+        assert!((get(&e, "host.slot_wait") - 0.005).abs() < 1e-9);
+        assert!((get(&e, "host.recorder") - (11.588 - 0.005 - 3.53)).abs() < 1e-9);
+        assert!((sum(&e) - sum(&without)).abs() < 1e-9);
+        assert!(render(&e).contains("wait for prebuild of these units"));
+        for (said, shown) in [(1e9, 11.583), (f64::NAN, 0.0), (-1.0, 0.0)] {
+            waited.prebuild_wait = said;
+            let e = remote(&marks, 11.86, &waited);
+            assert!(
+                (get(&e, "host.prebuild_wait") - shown).abs() < 1e-9,
+                "{said}"
+            );
+            assert!((sum(&e) - sum(&without)).abs() < 1e-9);
+        }
+        // It happened before the host recorder started, so the recorder's
+        // own measurements share only what it leaves.
+        waited = RemoteTimes {
+            prebuild_wait: 3.53,
+            ..times.clone()
+        };
+        let e = remote(&marks, 11.86, &waited);
+        assert!((get(&e, "host.prebuild_wait") - 3.53).abs() < 1e-9);
+        assert!(get(&e, "host.toolchain") < 11.588 - 3.53);
+        assert!((sum(&e) - sum(&without)).abs() < 1e-9);
+
+        // A host that reports more than the agent measured is scaled down,
+        // never past the residual.
+        times.slot_wait = 0.0;
+        times.host_own.toolchain = 100.0;
+        let e = remote(&marks, 11.86, &times);
+        assert!((sum(&e) - sum(&without)).abs() < 1e-9);
+        assert!(get(&e, "host.recorder") < 1e-9);
+        assert!((get(&e, "host.toolchain") - 11.588 * 100.0 / 100.018).abs() < 1e-9);
+
+        // A reconstructed waterfall has no marks to trust.
+        let mut derived = host.clone();
+        derived.derived = true;
+        assert_eq!(HostOwn::of(Some(&derived)), HostOwn::default());
+        assert_eq!(HostOwn::of(None), HostOwn::default());
     }
 
     #[test]
@@ -693,14 +1237,17 @@ mod tests {
                 link_ms: 50.0,
                 push_ms: 300.0,
                 barrier_ms: 60.0,
+                ..Default::default()
             }),
             slot_wait: 0.0,
+            host_own: HostOwn::default(),
             host_wall: 5.0,
             host_phases: Phases {
                 compile: 4.0,
                 test_run: 1.0,
                 ..Default::default()
             },
+            ..Default::default()
         };
         // Pseudo-random times, some marks absent, in arbitrary order.
         let mut seed = 7u64;

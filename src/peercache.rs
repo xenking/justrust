@@ -74,7 +74,11 @@ const MIN_GAIN_SECS: f64 = 0.15;
 /// Fixed cost of a fetch (round trip, unpack) in seconds.
 const FETCH_FIXED_SECS: f64 = 0.08;
 /// Key set refreshed at most this often.
-const KEYSET_TTL: Duration = Duration::from_secs(5);
+const KEYSET_TTL: Duration = Duration::from_secs(30);
+/// Keep ruling out absent keys with the previous key set while a background
+/// refresh is in flight, up to this age. Returning `None` during a refresh
+/// sends every concurrent rustc shim on a WAN round trip (`miss-peer`).
+const KEYSET_MAX_STALE: Duration = Duration::from_secs(120);
 /// Most entries one background push or pull moves.
 const SYNC_MAX_ITEMS: usize = 400;
 
@@ -744,7 +748,8 @@ impl Relay {
                 me.keys_loading.store(false, Ordering::SeqCst);
             });
         }
-        cur.filter(|_| !stale).map(|(_, k)| k)
+        cur.filter(|(t, _)| t.elapsed() <= KEYSET_MAX_STALE)
+            .map(|(_, k)| k)
     }
 
     /// Forget the peer's key set (it just gained entries).
@@ -1380,6 +1385,8 @@ mod relay_tests {
             first_bundle_end: Option<Instant>,
             bundles: usize,
             frames: usize,
+            /// Data frames sent when the first bundle was complete.
+            first_bundle_frames: usize,
         }
 
         fn endpoint(
@@ -1417,7 +1424,10 @@ mod relay_tests {
                     }
                     if let Some(t) = final_timing.as_mut() {
                         t.bundles += 1;
-                        t.first_bundle_end.get_or_insert_with(Instant::now);
+                        if t.first_bundle_end.is_none() {
+                            t.first_bundle_end = Some(Instant::now());
+                            t.first_bundle_frames = t.frames;
+                        }
                     }
                     true
                 } else {
@@ -1441,7 +1451,8 @@ mod relay_tests {
         fn foreground_yield_transport_acceptance() {
             let source = Cache::new();
             let next = source.populate();
-            let mut measured = Vec::new();
+            // Data frames the source had sent when the pull returned.
+            let mut sent = Vec::new();
             for legacy in [true, false] {
                 let local = Cache::new();
                 let idle = Arc::new(AtomicBool::new(true));
@@ -1460,6 +1471,19 @@ mod relay_tests {
                         t.frames >= t.bundles * 3,
                         "fixture must span multiple chunks"
                     );
+                    if !legacy {
+                        // The claim, in what was sent rather than how long it
+                        // took: once the foreground arrived, the pull returned
+                        // with the bundle in flight and asked for nothing more.
+                        // The source sends a frame only when asked, so this
+                        // count cannot move with machine load. It used to be
+                        // `wait <= residual + 100ms`, which a descheduled
+                        // receiver thread fails with the whole suite running.
+                        assert_eq!(
+                            t.frames, t.first_bundle_frames,
+                            "frames were sent after the in-flight bundle"
+                        );
+                    }
                     (
                         done.duration_since(t.arrival.unwrap()),
                         t.first_bundle_end
@@ -1474,12 +1498,6 @@ mod relay_tests {
                 let missing = wanted(&local.0, &journal_since(&source.0, 0).0);
                 assert_eq!(missing.len(), if legacy { 0 } else { ENTRIES - 1 });
                 if !legacy {
-                    // Scheduler/decompression overhead is allowed, but no extra bundle
-                    // latency may be charged after the in-flight bundle completes.
-                    assert!(
-                        wait <= residual + Duration::from_millis(100),
-                        "wait={wait:?}, in-flight residual={residual:?}"
-                    );
                     let resumed = client.pull_new_while(first.2, || true);
                     assert_eq!((resumed.0, resumed.2), (ENTRIES - 1, next));
                     assert_eq!(timing.lock().unwrap().bundles, ENTRIES);
@@ -1503,7 +1521,7 @@ mod relay_tests {
                     frames,
                     first.0
                 );
-                measured.push(wait);
+                sent.push(frames);
                 // Darwin can report ENOTCONN once shutting down the first
                 // endpoint has already disconnected its peer. That is the
                 // intended terminal state, not a failed cache transfer.
@@ -1515,9 +1533,11 @@ mod relay_tests {
                 client_reader.join().unwrap();
                 server_reader.join().unwrap();
             }
+            // Every data frame costs the foreground PACE on this transport, so
+            // the control's cost is the frames of the bundles it did not skip.
             assert!(
-                measured[0] > measured[1] + PACE * 3,
-                "control must pay for subsequent bundles: {measured:?}"
+                sent[0] >= sent[1] + (ENTRIES - 1) * 3,
+                "control must pay for subsequent bundles: {sent:?} data frames"
             );
         }
     }
@@ -1731,44 +1751,6 @@ mod relay_tests {
         assert_eq!(relay.pull_new_while(0, || true), (0, 0, 0));
     }
 
-    /// A relay whose peer answers `CacheKeys` with `keys` and every
-    /// `CacheQuery` with one line, counting the queries it sees.
-    fn relay_with_peer(keys: &'static str) -> (Arc<Relay>, Arc<AtomicU32>) {
-        let queries = Arc::new(AtomicU32::new(0));
-        let slot: Arc<Mutex<Option<Arc<Relay>>>> = Arc::default();
-        let (s2, q2) = (slot.clone(), queries.clone());
-        let relay = Relay::new(true, move |m, _| {
-            let me = s2.lock().unwrap().clone().unwrap();
-            let reply = match m {
-                Msg::CacheKeys { id } => {
-                    Some((Msg::CacheKeySet { id: *id }, keys.as_bytes().to_vec()))
-                }
-                Msg::CacheQuery { id, .. } => {
-                    q2.fetch_add(1, Ordering::SeqCst);
-                    Some((
-                        Msg::CacheLines {
-                            id: *id,
-                            lines: vec!["l".into()],
-                            outs: vec![],
-                            busy: 0,
-                            bw: 0.0,
-                        },
-                        vec![],
-                    ))
-                }
-                _ => None,
-            };
-            if let Some((m, p)) = reply {
-                std::thread::spawn(move || {
-                    me.on_frame(&m, &p);
-                });
-            }
-            true
-        });
-        *slot.lock().unwrap() = Some(relay.clone());
-        (relay, queries)
-    }
-
     /// Chunks of a put are assembled in arrival order, synchronously: with
     /// a thread per chunk (the old code) earlier chunks could land after
     /// later ones. Checked before the last chunk, so no serving thread runs.
@@ -1795,35 +1777,43 @@ mod relay_tests {
     }
 
     #[test]
-    fn fresh_key_set_rules_out_misses_but_stale_one_never_does() {
-        let (r, q) = relay_with_peer("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    fn peer_key_set_rules_out_misses_only_within_max_stale() {
+        let cache = CacheFixture::new();
+        let (started, refreshing) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let r = scripted_relay(&cache.0, move |me, msg, _| match msg {
+            Msg::CacheKeys { .. } => {
+                started.send(()).unwrap();
+                let _ = gate.lock().unwrap().recv();
+                false
+            }
+            Msg::CacheQuery { id, .. } => me.on_frame(
+                &Msg::CacheLines {
+                    id: *id,
+                    lines: vec!["peer hit".into()],
+                    outs: vec![],
+                    busy: 0,
+                    bw: 0.0,
+                },
+                &[],
+            ),
+            _ => panic!("unexpected frame: {msg:?}"),
+        });
         let other = "b".repeat(32);
-        // No key set yet: ask the peer.
-        assert_eq!(r.query(&other).0.len(), 1);
-        for _ in 0..100 {
-            if r.keys.lock().unwrap().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // Fresh set without the key: answered locally, no round trip.
-        let before = q.load(Ordering::SeqCst);
+        let seed =
+            |age: Duration| *r.keys.lock().unwrap() = Some((Instant::now() - age, Arc::default()));
+        seed(Duration::ZERO);
         assert!(r.query(&other).0.is_empty());
-        assert_eq!(q.load(Ordering::SeqCst), before);
-        // Stale set (the peer may have gained the key since): ask again.
-        r.keys.lock().unwrap().as_mut().unwrap().0 -= KEYSET_TTL * 2;
-        assert_eq!(r.query(&other).0.len(), 1);
-        // That query started a background refresh. Let it land first, or it
-        // can store a fresh set right after the invalidation below (seen on
-        // a slow macOS CI runner).
-        for _ in 0..400 {
-            if !r.keys_loading.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // Invalidated after a push: ask again.
+        seed(KEYSET_TTL + Duration::from_secs(1));
+        assert!(r.query(&other).0.is_empty());
+        refreshing.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Keep the refresh in flight while checking expired and invalidated snapshots.
+        seed(KEYSET_MAX_STALE + Duration::from_secs(1));
+        assert_eq!(r.query(&other).0, ["peer hit"]);
+        seed(Duration::ZERO);
         r.invalidate_keys();
-        assert_eq!(r.query(&other).0.len(), 1);
+        assert_eq!(r.query(&other).0, ["peer hit"]);
+        drop(release);
     }
 }

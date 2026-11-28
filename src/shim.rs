@@ -87,6 +87,82 @@ pub struct Unit {
     /// compiler.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reuse: Vec<crate::reuse::Row>,
+    /// Seconds the shim spent before `start` (the compiler spawn, or the
+    /// cache tier that hit): argument rewriting, cache keys and every cache
+    /// tier that missed. Cargo holds a job slot for all of it, and none of
+    /// it is inside `wall`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shim_pre_secs: Option<f64>,
+    /// Seconds the shim spent after `end` before it recorded the unit
+    /// (storing the outputs in the caches). Absent on cache hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shim_post_secs: Option<f64>,
+    /// Where `shim_pre_secs` and `shim_post_secs` went: stages of at least
+    /// a millisecond, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shim_stages: Vec<ShimStage>,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize, Clone, PartialEq)]
+pub struct ShimStage {
+    pub name: String,
+    pub secs: f64,
+}
+
+/// Wall-clock split of the shim's own work around one compiler invocation.
+struct Stages {
+    last: std::time::Instant,
+    pre: f64,
+    post: f64,
+    after: bool,
+    rows: Vec<ShimStage>,
+}
+
+impl Stages {
+    fn new(started: std::time::Instant) -> Self {
+        Stages {
+            last: started,
+            pre: 0.0,
+            post: 0.0,
+            after: false,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Charge the time since the previous mark to `name`.
+    fn mark(&mut self, name: &str) {
+        let now = std::time::Instant::now();
+        let secs = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        if self.after {
+            self.post += secs;
+        } else {
+            self.pre += secs;
+        }
+        if secs < 0.001 {
+            return;
+        }
+        match self.rows.iter_mut().find(|r| r.name == name) {
+            Some(r) => r.secs += secs,
+            None => self.rows.push(ShimStage {
+                name: name.to_owned(),
+                secs,
+            }),
+        }
+    }
+
+    /// The compiler ran since the last mark: that time is the unit's own
+    /// `wall`, not the shim's.
+    fn resume_after(&mut self) {
+        self.last = std::time::Instant::now();
+        self.after = true;
+    }
+
+    fn apply(&self, unit: &mut Unit) {
+        unit.shim_pre_secs = Some(self.pre);
+        unit.shim_post_secs = self.after.then_some(self.post);
+        unit.shim_stages = self.rows.clone();
+    }
 }
 
 #[derive(Debug, Serialize, serde::Deserialize, Clone)]
@@ -115,6 +191,7 @@ fn real_rustc() -> PathBuf {
 }
 
 pub fn main() -> ! {
+    let started = std::time::Instant::now();
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let real = real_rustc();
     share_slot_incremental(&mut args);
@@ -135,7 +212,7 @@ pub fn main() -> ! {
         eprintln!("{}", crate::nolocal::refusal("a local rustc"));
         std::process::exit(1);
     }
-    match run_unit(&real, &args, &run_dir) {
+    match run_unit(&real, &args, &run_dir, started) {
         Some(code) => std::process::exit(code),
         None => exec(&real, &args),
     }
@@ -152,6 +229,12 @@ fn share_slot_incremental(args: &mut [OsString]) {
     if std::env::var_os("JUSTRUST_SHARED_INCREMENTAL").is_some_and(|v| v == "0") {
         return;
     }
+    let base = std::env::var_os("JUSTRUST_SHARED_INCREMENTAL_DIR");
+    share_slot_incremental_in(args, base.as_deref());
+}
+
+/// `share_slot_incremental` with the hosted shared base passed in.
+fn share_slot_incremental_in(args: &mut [OsString], base: Option<&std::ffi::OsStr>) {
     for i in 0..args.len() {
         let a = args[i].to_string_lossy().into_owned();
         let (prefix, path) = if let Some(p) = a.strip_prefix("-Cincremental=") {
@@ -160,7 +243,7 @@ fn share_slot_incremental(args: &mut [OsString]) {
             && let Some(next) = args.get(i + 1).map(|n| n.to_string_lossy().into_owned())
             && let Some(p) = next.strip_prefix("incremental=")
         {
-            let Some(shared) = shared_incremental_dir(std::path::Path::new(p)) else {
+            let Some(shared) = shared_incremental_dir(std::path::Path::new(p), base) else {
                 return;
             };
             args[i + 1] = format!("incremental={}", shared.display()).into();
@@ -168,7 +251,7 @@ fn share_slot_incremental(args: &mut [OsString]) {
         } else {
             continue;
         };
-        if let Some(shared) = shared_incremental_dir(std::path::Path::new(&path)) {
+        if let Some(shared) = shared_incremental_dir(std::path::Path::new(&path), base) {
             args[i] = format!("{prefix}{}", shared.display()).into();
         }
         return;
@@ -176,18 +259,18 @@ fn share_slot_incremental(args: &mut [OsString]) {
 }
 
 /// Redirect `-C incremental=...` to a shared incremental directory:
-/// 1. If `JUSTRUST_SHARED_INCREMENTAL_DIR` is set (e.g. hosted canonical repo
-///    guard), map `<anything>/<profile>/incremental` to
-///    `<JUSTRUST_SHARED_INCREMENTAL_DIR>/<profile>/incremental` so all
-///    worktrees of the same repo share one warm incremental cache.
+/// 1. If `base` (`JUSTRUST_SHARED_INCREMENTAL_DIR`, e.g. hosted canonical repo
+///    guard) is set, map `<anything>/<profile>/incremental` to
+///    `<base>/<profile>/incremental` so all worktrees of the same repo share
+///    one warm incremental cache.
 /// 2. Otherwise map `<root>/justrust-slots/<n>/<rest...>/incremental` ->
 ///    `<root>/<rest...>/incremental`.
-fn shared_incremental_dir(p: &std::path::Path) -> Option<PathBuf> {
+fn shared_incremental_dir(p: &std::path::Path, base: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let comps: Vec<_> = p.components().collect();
     if comps.last()?.as_os_str() != "incremental" {
         return None;
     }
-    if let Some(base) = std::env::var_os("JUSTRUST_SHARED_INCREMENTAL_DIR")
+    if let Some(base) = base
         && !base.is_empty()
         && comps.len() >= 2
     {
@@ -449,7 +532,7 @@ fn phase_ledger_environment(cmd: &mut Command, ledger: Option<&std::path::Path>)
 }
 
 /// Parse a phase ledger: `label\tseconds\tcount` per line.
-fn parse_phase_ledger(text: &str) -> Vec<Pass> {
+pub(crate) fn parse_phase_ledger(text: &str) -> Vec<Pass> {
     text.lines()
         .filter_map(|l| {
             let mut f = l.split('\t');
@@ -577,7 +660,14 @@ fn want_passes(args: &[OsString], local: bool) -> (bool, bool) {
 }
 
 /// Returns `None` only if the compiler could not be spawned at all.
-fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Option<i32> {
+fn run_unit(
+    real: &PathBuf,
+    args: &[OsString],
+    run_dir: &std::path::Path,
+    started: std::time::Instant,
+) -> Option<i32> {
+    let mut stages = Stages::new(started);
+    stages.mark("args");
     let hit_started = std::time::Instant::now();
     let described = describe(args);
     let plan = (!described.local && crate::depcache::enabled())
@@ -586,6 +676,7 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
             crate::depcache::plan(real, args, &env)
         })
         .flatten();
+    stages.mark("key");
     // Local units link with wild when installed (fail open inside the `ld`
     // dispatcher). Never for depcache units (registry crates).
     let nightly = std::env::var_os("JUSTRUST_TOOLCHAIN_NIGHTLY").is_some();
@@ -596,7 +687,8 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
     // Local opt-level=0 codegen units use Cranelift when the active nightly
     // toolchain ships `librustc_codegen_cranelift*.so`. Registry deps stay on
     // LLVM so they hit the prebuilt store; Cranelift links cleanly against
-    // LLVM-compiled `.rlib`s (identical `.rmeta` + ELF `.o` ABI).
+    // LLVM-compiled `.rlib`s (identical `.rmeta` + ELF `.o` ABI). A backend
+    // without landing-pad support compiles `panic=abort` units only.
     let cranelift_on = plan.is_none() && cranelift_eligible(real, args, &described, nightly);
     if cranelift_on {
         link_args.push(OsString::from("-Zcodegen-backend=cranelift"));
@@ -615,17 +707,20 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
         })
         .flatten();
     let plan_secs = paths::now() - plan_t0;
+    stages.mark("local-key");
     if let Some(lp) = &local_plan {
         let start = paths::now();
         if let Some(hit) = crate::localcache::restore(lp, &mut std::io::stderr()) {
             let end = paths::now();
             let mut unit = described;
+            stages.apply(&mut unit);
             unit.start = start;
             unit.end = end;
             unit.wall = end - start;
             unit.rmeta_secs = Some(unit.wall);
             unit.depcache = "local".into();
             unit.depcache_saved_secs = Some(hit.saved_secs);
+            let _ = crate::buildscript::wrap(&lp.out_dir, &lp.crate_name, &lp.extra);
             unit.cache_hit_overhead_secs = Some(hit_started.elapsed().as_secs_f64());
             write_unit_cost(args, hit.saved_secs, "wall");
             if let Ok(line) = serde_json::to_string(&unit) {
@@ -633,29 +728,37 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
             }
             return Some(0);
         }
+        stages.mark("miss-localcache");
     }
     if let Some(plan) = &plan {
-        let start = paths::now();
         let mut err = std::io::stderr();
         // Tiers, cheapest first: this machine, the prebuilt store (static
         // HTTP, anonymous), the account and shared cache (HTTP), then the
         // peer machine over the remote link.
-        let mut tier = "hit";
-        let found = plan
-            .restore(&mut err)
-            .or_else(|| {
-                tier = "prebuilt";
-                crate::depcache_prebuilt::fetch(plan, &mut err)
-            })
-            .or_else(|| {
-                tier = "remote";
-                crate::depcache_remote::fetch(plan, &mut err)
-            })
-            .or_else(|| {
-                tier = "peer";
-                crate::peercache::fetch(plan, &mut err)
-            });
-        if let Some(hit) = found {
+        // A tier that misses is charged to the shim (`miss-<tier>`), and a
+        // hit's `wall` is the tier that hit: a miss pays for all four before
+        // the compiler starts.
+        let mut found = None;
+        for (name, missed) in [
+            ("hit", "miss-local"),
+            ("prebuilt", "miss-prebuilt"),
+            ("remote", "miss-remote"),
+            ("peer", "miss-peer"),
+        ] {
+            let start = paths::now();
+            let got = match name {
+                "hit" => plan.restore(&mut err),
+                "prebuilt" => crate::depcache_prebuilt::fetch(plan, &mut err),
+                "remote" => crate::depcache_remote::fetch(plan, &mut err),
+                _ => crate::peercache::fetch(plan, &mut err),
+            };
+            if let Some(hit) = got {
+                found = Some((name, start, hit));
+                break;
+            }
+            stages.mark(missed);
+        }
+        if let Some((tier, start, hit)) = found {
             // Downloaded from the account or shared cache: the peer
             // machine likely lacks it too, so offer it on the next sync.
             if matches!(tier, "remote" | "prebuilt")
@@ -666,6 +769,7 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
             }
             let end = paths::now();
             let mut unit = described;
+            stages.apply(&mut unit);
             unit.start = start;
             unit.end = end;
             unit.wall = end - start;
@@ -681,11 +785,6 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
             return Some(0);
         }
     }
-    // Every tier missed: name the key part that moved, while the unit's
-    // inputs are still the ones the key was computed from.
-    let why = plan
-        .as_ref()
-        .map(|p| crate::depcache_why::diagnose(p, real, args));
     let (passes_on, force_bootstrap) = want_passes(args, described.local);
     let mut cmd = Command::new(real);
     cmd.args(args).stderr(Stdio::piped());
@@ -716,6 +815,10 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
     } else {
         None
     };
+    stages.mark("spawn-setup");
+    // Build hosts only: wait until the machine has memory for this unit.
+    let memory = crate::memgov::admit(&described, args, run_dir);
+    stages.mark(memory.stage());
     let start = paths::now();
     let spawned = cmd.spawn();
     let early = early.map(EarlyReply::spawned);
@@ -734,6 +837,14 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
             forward_stderr(stderr, passes_on, &rmeta_at, &passes, captured.as_deref())
         })
     };
+    // Every tier missed: name the key part that moved. This runs beside the
+    // compiler, not before it (it cost 0.5 to 0.8s of job time over 206
+    // misses when it ran first). The compiler does not rewrite its inputs
+    // and the manifest and ledger only change when this shim stores below,
+    // so the answer is the same.
+    let why = plan
+        .as_ref()
+        .map(|p| crate::depcache_why::diagnose(p, real, args));
 
     // jr-rustc replied after the link (outputs complete, no errors, all
     // diagnostics printed) and is still persisting its incremental state:
@@ -751,6 +862,7 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
         crate::sys::wait_usage(&mut child, job.as_ref())
     };
     let end = paths::now();
+    stages.resume_after();
     let _ = reader.join();
     if replied {
         // Not reaped: cargo never waits for it, init adopts it on exit.
@@ -778,6 +890,7 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
         }
         return retry.status().ok().and_then(|s| s.code());
     }
+    memory.release();
 
     let mut unit = described;
     if let (Some(plan), Some(captured)) = (&plan, &captured) {
@@ -822,6 +935,10 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
                 "stage": paths::now() - t, "staged": staged,
             });
             let _ = paths::append_line(&run_dir.join("localcache.jsonl"), &line.to_string());
+            // After staging, as for dependencies: the cache keeps the real
+            // binary, and cargo runs the wrapper that replays cached runs
+            // of a workspace build script (`buildscript.rs`).
+            let _ = crate::buildscript::wrap(&lp.out_dir, &lp.crate_name, &lp.extra);
         }
     }
     unit.start = start;
@@ -868,7 +985,10 @@ fn run_unit(real: &PathBuf, args: &[OsString], run_dir: &std::path::Path) -> Opt
     if exit == 0 {
         write_unit_cost(args, user + sys, "cpu");
     }
+    crate::memgov::learn(&unit);
     unit.incr_prior_session = incr_prior_session;
+    stages.mark("store");
+    stages.apply(&mut unit);
     if let Ok(line) = serde_json::to_string(&unit) {
         let _ = paths::append_line(&run_dir.join("units.jsonl"), &line);
     }
@@ -1151,31 +1271,111 @@ fn cranelift_enabled_env() -> bool {
     }
 }
 
-fn cranelift_backend_present(real: &std::path::Path) -> bool {
+/// The Cranelift codegen backend library shipped in the toolchain's sysroot.
+fn cranelift_backend(real: &std::path::Path) -> Option<PathBuf> {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
         let _ = real;
-        return false;
+        None
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        let Some(sysroot) = real.parent().and_then(|p| p.parent()) else {
-            return false;
-        };
+        let sysroot = real.parent().and_then(|p| p.parent())?;
         let backends = sysroot
             .join("lib")
             .join("rustlib")
             .join("x86_64-unknown-linux-gnu")
             .join("codegen-backends");
-        let Ok(entries) = std::fs::read_dir(backends) else {
-            return false;
-        };
-        entries.flatten().any(|e| {
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            s.starts_with("librustc_codegen_cranelift") && s.ends_with(".so")
-        })
+        std::fs::read_dir(backends)
+            .ok()?
+            .flatten()
+            .find(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.starts_with("librustc_codegen_cranelift") && s.ends_with(".so")
+            })
+            .map(|e| e.path())
     }
+}
+
+/// Exported by a backend that was built with landing-pad support
+/// (`toolchain/rustc/compiler/rustc_codegen_cranelift/src/lib.rs`).
+const CRANELIFT_UNWINDING_MARKER: &[u8] = b"JUSTRUST_CG_CLIF_UNWINDING_V1";
+
+/// Can this backend library compile `-Cpanic=unwind` code correctly? One
+/// built without its `unwinding` feature emits no landing pads: a
+/// `catch_unwind` in the crate does not catch, a panicking thread aborts the
+/// whole process (`failed to initiate panic, error 5`) and destructors are
+/// skipped while unwinding. That silently changes program behavior, so such
+/// a backend is used for `panic=abort` units only.
+fn cranelift_backend_unwinds(backend: &std::path::Path) -> bool {
+    let probes = crate::paths::home()
+        .ok()
+        .map(|home| home.join("cache").join("probe"));
+    cranelift_backend_unwinds_memo(backend, probes.as_deref())
+}
+
+fn cranelift_backend_unwinds_memo(
+    backend: &std::path::Path,
+    probes: Option<&std::path::Path>,
+) -> bool {
+    let Ok(meta) = std::fs::metadata(backend) else {
+        return false;
+    };
+    // The library is tens of megabytes: remember the answer per file
+    // identity so only the first unit after a toolchain install scans it.
+    let memo = probes.map(|dir| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        backend.hash(&mut h);
+        meta.len().hash(&mut h);
+        meta.modified().ok().hash(&mut h);
+        dir.join(format!("clif-unwind-{:016x}", h.finish()))
+    });
+    if let Some(memo) = &memo {
+        match std::fs::read(memo).as_deref() {
+            Ok(b"1") => return true,
+            Ok(b"0") => return false,
+            _ => {}
+        }
+    }
+    let Ok(file) = std::fs::File::open(backend) else {
+        return false;
+    };
+    // SAFETY: a read-only private view of an installed toolchain file.
+    let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
+        return false;
+    };
+    let unwinds = memchr::memmem::find(&map, CRANELIFT_UNWINDING_MARKER).is_some();
+    if let Some(memo) = &memo
+        && let Some(dir) = memo.parent()
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let _ = std::fs::write(memo, if unwinds { b"1" } else { b"0" });
+    }
+    unwinds
+}
+
+/// Does the unit compile with `-C panic=abort`? (The last `-C panic` wins.)
+fn panic_aborts(args: &[OsString]) -> bool {
+    let mut strategy = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].to_string_lossy();
+        let cg = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(|x| x.to_string_lossy().into_owned())
+        } else {
+            a.strip_prefix("-C")
+                .or_else(|| a.strip_prefix("--codegen="))
+                .map(str::to_owned)
+        };
+        if let Some(v) = cg.as_deref().and_then(|c| c.strip_prefix("panic=")) {
+            strategy = Some(v.to_owned());
+        }
+        i += 1;
+    }
+    matches!(strategy.as_deref(), Some("abort" | "immediate-abort"))
 }
 
 fn cranelift_args_eligible(args: &[OsString], described: &Unit) -> bool {
@@ -1249,7 +1449,8 @@ fn cranelift_eligible(
     nightly
         && cranelift_enabled_env()
         && cranelift_args_eligible(args, described)
-        && cranelift_backend_present(real)
+        && cranelift_backend(real)
+            .is_some_and(|backend| panic_aborts(args) || cranelift_backend_unwinds(&backend))
 }
 
 fn cranelift_fallback_needed(captured: &[Vec<u8>]) -> bool {
@@ -1307,7 +1508,9 @@ mod tests {
 
     #[test]
     fn slot_incremental_maps_to_shared_dir() {
-        let m = |p: &str| shared_incremental_dir(std::path::Path::new(p));
+        // The base is passed in: a hosted test run inherits the agent's
+        // `JUSTRUST_SHARED_INCREMENTAL_DIR`.
+        let m = |p: &str| shared_incremental_dir(std::path::Path::new(p), None);
         assert_eq!(
             m("/w/target/justrust-slots/2/debug/incremental"),
             Some(PathBuf::from("/w/target/debug/incremental"))
@@ -1330,7 +1533,7 @@ mod tests {
         .iter()
         .map(OsString::from)
         .collect();
-        share_slot_incremental(&mut a);
+        share_slot_incremental_in(&mut a, None);
         let expected: PathBuf = PathBuf::from("/t/debug/incremental").components().collect();
         assert_eq!(
             a[1],
@@ -1339,11 +1542,24 @@ mod tests {
         let mut b = vec![OsString::from(
             "-Cincremental=/t/justrust-slots/1/debug/incremental",
         )];
-        share_slot_incremental(&mut b);
+        share_slot_incremental_in(&mut b, None);
         assert_eq!(
             b[0],
             OsString::from(format!("-Cincremental={}", expected.display()))
         );
+        // A hosted base wins for any worktree and keeps only the profile.
+        let base = std::env::temp_dir().join(format!("jr-shared-incr-{}", std::process::id()));
+        let mut c = vec![OsString::from(
+            "-Cincremental=/t/justrust-slots/1/debug/incremental",
+        )];
+        share_slot_incremental_in(&mut c, Some(base.as_os_str()));
+        let shared = base.join("debug").join("incremental");
+        assert_eq!(
+            c[0],
+            OsString::from(format!("-Cincremental={}", shared.display()))
+        );
+        assert!(shared.is_dir());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1695,6 +1911,40 @@ mod tests {
         // non-local registry dep -> skip
         u.local = false;
         assert!(!cranelift_args_eligible(&os(&[]), &u));
+    }
+
+    #[test]
+    fn cranelift_needs_an_unwinding_backend_unless_the_unit_aborts() {
+        let os = |s: &[&str]| s.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(!panic_aborts(&os(&["--crate-name", "foo", "--test"])));
+        assert!(!panic_aborts(&os(&["-C", "panic=unwind"])));
+        assert!(panic_aborts(&os(&["-C", "panic=abort"])));
+        assert!(panic_aborts(&os(&["-Cpanic=abort", "-C", "opt-level=0"])));
+        assert!(panic_aborts(&os(&["--codegen=panic=immediate-abort"])));
+        // The last strategy wins, as in rustc.
+        assert!(!panic_aborts(&os(&["-Cpanic=abort", "-C", "panic=unwind"])));
+
+        let dir = std::env::temp_dir().join(format!("jr-clif-unwind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probes = dir.join("probe");
+        let plain = dir.join("librustc_codegen_cranelift-old.so");
+        std::fs::write(&plain, b"\x7fELF __rustc_codegen_backend").unwrap();
+        let unwinding = dir.join("librustc_codegen_cranelift-new.so");
+        let mut bytes = b"\x7fELF __rustc_codegen_backend ".to_vec();
+        bytes.extend_from_slice(CRANELIFT_UNWINDING_MARKER);
+        std::fs::write(&unwinding, &bytes).unwrap();
+        for _memoized in 0..2 {
+            assert!(!cranelift_backend_unwinds_memo(&plain, Some(&probes)));
+            assert!(cranelift_backend_unwinds_memo(&unwinding, Some(&probes)));
+        }
+        assert_eq!(std::fs::read_dir(&probes).unwrap().count(), 2);
+        assert!(cranelift_backend_unwinds_memo(&unwinding, None));
+        assert!(!cranelift_backend_unwinds_memo(
+            &dir.join("missing.so"),
+            Some(&probes)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

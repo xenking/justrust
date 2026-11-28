@@ -123,12 +123,20 @@ pub fn split_exit_marker(chunk: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&chunk[..i], &chunk[i + EXIT_MARKER.len()..]))
 }
 
-/// `JUSTRUST_EARLY_EXIT=1`: return rust-analyzer's errors in the changed
-/// files at once, before rustc confirms them. Needs the build daemon, which
-/// keeps cargo running so the next identical request and `justrust log`
-/// get rustc's verdict. Turns early diagnostics on (`JUSTRUST_EARLY`
-/// defaults to on with it).
+/// `JUSTRUST_EARLY_EXIT` (default on; `0` disables): return rust-analyzer's
+/// errors in the changed files at once, before rustc confirms them. Needs the
+/// build daemon, which keeps cargo running so the next identical request and
+/// `justrust log` get rustc's verdict. Setting `JUSTRUST_EARLY_EXIT=1`
+/// explicitly also turns `JUSTRUST_EARLY` on (`Mode::On`) when unset.
 pub fn exit_wanted() -> bool {
+    parse_exit_wanted(std::env::var("JUSTRUST_EARLY_EXIT").ok().as_deref())
+}
+
+fn parse_exit_wanted(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "off" | "false" | "no"))
+}
+
+fn exit_explicit() -> bool {
     matches!(
         std::env::var("JUSTRUST_EARLY_EXIT").as_deref(),
         Ok("1") | Ok("on") | Ok("true") | Ok("yes")
@@ -142,8 +150,8 @@ pub fn exit_eligible(diags: &[Diag]) -> bool {
     !diags.is_empty() && diags.iter().all(|d| !d.code.is_empty())
 }
 
-/// `JUSTRUST_EARLY`: unset or `0` = off, `auto` = query a running daemon
-/// and start one for workspaces with recent agent builds (`maybe_autostart`),
+/// `JUSTRUST_EARLY`: unset or `auto` = query a running daemon and start one
+/// for workspaces with recent agent builds (`maybe_autostart`), `0` = off,
 /// `query` = query a running daemon only, anything else = on (query, and
 /// start the daemon on first use). Remote startup requires a machine-local
 /// launcher.json argv prefix so resource policy failures never start unbounded.
@@ -159,15 +167,15 @@ pub enum Mode {
 pub fn mode() -> Mode {
     parse_mode(
         std::env::var("JUSTRUST_EARLY").ok().as_deref(),
-        exit_wanted(),
+        exit_explicit(),
     )
 }
 
 fn parse_mode(value: Option<&str>, exit: bool) -> Mode {
     match value {
         None if exit => Mode::On,
-        Some("0" | "off" | "no" | "false") | None => Mode::Off,
-        Some("auto") => Mode::Auto,
+        None | Some("auto") => Mode::Auto,
+        Some("0" | "off" | "no" | "false") => Mode::Off,
         Some("query") => Mode::Query,
         Some(_) => Mode::On,
     }
@@ -230,7 +238,17 @@ fn daemon_alive(dir: &Path) -> bool {
         .write(true)
         .open(dir.join("lock"))
     {
-        Ok(f) => f.try_lock().is_err(),
+        Ok(f) => {
+            let held = f.try_lock().is_err();
+            if !held {
+                // Unlock explicitly instead of on close: a child another
+                // thread is forking shares this open file until it execs and
+                // would keep the probe's lock, so the next probe (or the
+                // daemon being started) would find the lock taken.
+                let _ = f.unlock();
+            }
+            held
+        }
         Err(_) => false,
     }
 }
@@ -1858,10 +1876,16 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         assert!(!daemon_alive(&d));
         let f = std::fs::File::create(d.join("lock")).unwrap();
+        // The probe releases its own lock at once, even while another test
+        // thread is forking a child that shares the probe's open file.
         assert!(!daemon_alive(&d));
         f.try_lock().unwrap();
         assert!(daemon_alive(&d));
         drop(f);
+        // A child another test is forking can hold the lock until it execs.
+        #[cfg(unix)]
+        assert!(crate::test_fork::eventually(|| !daemon_alive(&d)));
+        #[cfg(not(unix))]
         assert!(!daemon_alive(&d));
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -1917,10 +1941,21 @@ mod tests {
     fn query_mode_never_requests_autostart_or_early_exit() {
         assert_eq!(parse_mode(Some("query"), false), Mode::Query);
         assert_eq!(parse_mode(Some("query"), true), Mode::Query);
-        assert_eq!(parse_mode(None, false), Mode::Off);
+        assert_eq!(parse_mode(None, false), Mode::Auto);
         assert_eq!(parse_mode(None, true), Mode::On);
         assert_eq!(parse_mode(Some("auto"), false), Mode::Auto);
         assert_eq!(parse_mode(Some("0"), true), Mode::Off);
+    }
+
+    #[test]
+    fn early_exit_defaults_on_and_respects_disable_values() {
+        assert!(parse_exit_wanted(None));
+        assert!(parse_exit_wanted(Some("1")));
+        assert!(parse_exit_wanted(Some("on")));
+        assert!(!parse_exit_wanted(Some("0")));
+        assert!(!parse_exit_wanted(Some("off")));
+        assert!(!parse_exit_wanted(Some("false")));
+        assert!(!parse_exit_wanted(Some("no")));
     }
 
     #[test]

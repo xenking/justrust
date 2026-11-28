@@ -26,6 +26,7 @@ class CandidateTests(unittest.TestCase):
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "user.name", "Test")
         for path in ("toolchain/rustc/build-jr.sh", "toolchain/cargo/build-jr.sh",
+                     "toolchain/shared/query_binding.rs",
                      "toolchain/rustc/git-commit-info", "docs/note.md"):
             file = self.root / path
             file.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +68,34 @@ class CandidateTests(unittest.TestCase):
                 candidate.build_stages(["bootstrap", "train", "cargo"], run)
             self.assertNotIn("train", seen)
 
+    def test_a_failed_cargo_build_is_repeated_before_training(self):
+        seen = []
+
+        def run(stage):
+            seen.append(stage)
+            if stage == "cargo" and seen.count("cargo") < 3:
+                raise subprocess.CalledProcessError(1, ["build-jr.sh"])
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            candidate.build_stages(["bootstrap", "train", "cargo"], run)
+        self.assertEqual(seen.count("cargo"), 3)
+        self.assertEqual(seen[-1], "train")
+        self.assertIn("attempt 2 of 3", err.getvalue())
+
+    def test_a_cargo_build_that_keeps_failing_stops_the_candidate(self):
+        seen = []
+
+        def run(stage):
+            seen.append(stage)
+            if stage == "cargo":
+                raise subprocess.CalledProcessError(1, ["build-jr.sh"])
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(subprocess.CalledProcessError):
+                candidate.build_stages(["bootstrap", "train", "cargo"], run)
+        self.assertEqual(seen.count("cargo"), candidate.CARGO_BUILD_ATTEMPTS)
+        self.assertNotIn("train", seen)
+
     def test_plan_identity_and_no_side_effects(self):
         plan = self.plan()
         self.assertEqual(plan["candidate_id"], "jr-" + self.revision)
@@ -74,6 +103,14 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(plan["version"], "0.1.1")
         self.assertEqual(plan["release_tag"], "toolchain-v0.1.1")
         self.assertEqual(plan["commands"][0]["argv"], ["bash", "toolchain/rustc/build-jr.sh", "release"])
+        cargo = plan["commands"][-1]
+        # Routing is the user's (`justrust local off` sends it to hosted): the
+        # release build never forces a local compile.
+        self.assertNotIn("JUSTRUST_REMOTE", cargo["env"])
+        self.assertNotIn("JUSTRUST_LOCAL", cargo["env"])
+        self.assertEqual(cargo["cwd"], plan["cargo_build_root"])
+        self.assertEqual(cargo["produces"], plan["artifacts"]["jr_cargo"])
+        self.assertTrue(plan["artifacts"]["jr_cargo"].startswith(plan["cargo_build_root"] + "/"))
         self.assertFalse(self.output.exists())
 
     def test_invalid_committed_version_refused(self):
@@ -115,12 +152,26 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dirty relevant"):
             self.plan()
 
+    def test_a_client_release_after_the_revision_does_not_stop_the_build(self):
+        (self.root / "Cargo.toml").write_text('[package]\nversion = "0.1.2"\n')
+        (self.root / "Cargo.lock").write_text("version = 4\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Release v0.1.2")
+        self.assertEqual(self.plan()["source_revision"], self.revision)
+
+    def test_toolchain_source_committed_after_the_revision_stops_the_build(self):
+        (self.root / "toolchain/shared/query_binding.rs").write_text("changed\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "compiler change")
+        with self.assertRaisesRegex(ValueError, "toolchain source changed"):
+            self.plan()
+
     def test_unrelated_dirty_allowed_and_untracked_excluded_from_archive(self):
         (self.root / "docs/note.md").write_text("unrelated\n")
         (self.root / "toolchain/untracked").write_text("not committed\n")
         self.assertEqual(self.plan()["source_revision"], self.revision)
 
-    def run_mock_build(self, plan, fail=False, mismatch=False):
+    def run_mock_build(self, plan, fail=False, mismatch=False, no_cargo_binary=False):
         real_run = subprocess.run
 
         def run(argv, **kwargs):
@@ -130,6 +181,17 @@ class CandidateTests(unittest.TestCase):
             self.assertEqual(kwargs["env"]["CI"], "1")
             snapshot = Path(plan["build_root"])
             self.assertFalse((snapshot / ".git").exists())
+            # jr-cargo's tree: a git root holding toolchain/ without the compiler.
+            cargo_root = Path(plan["cargo_build_root"])
+            self.assertTrue((cargo_root / ".git").is_dir())
+            self.assertTrue((cargo_root / "toolchain/cargo/build-jr.sh").is_file())
+            self.assertTrue((cargo_root / "toolchain/shared/query_binding.rs").is_file())
+            self.assertFalse((cargo_root / "toolchain/rustc").exists())
+            self.assertFalse((cargo_root / "docs").exists())
+            if "cargo" in argv[1]:
+                self.assertEqual(kwargs["cwd"], str(cargo_root))
+                if no_cargo_binary:
+                    return subprocess.CompletedProcess(argv, 0)
             self.assertEqual((snapshot / "toolchain/rustc/git-commit-info").read_text().splitlines()[0], self.revision)
             if fail:
                 raise subprocess.CalledProcessError(7, argv)
@@ -164,6 +226,13 @@ class CandidateTests(unittest.TestCase):
     def test_actual_compiler_identity_required(self):
         with self.assertRaisesRegex(ValueError, "identity"):
             self.run_mock_build(self.plan(), mismatch=True)
+
+    def test_cargo_helper_without_binary_fails(self):
+        plan = self.plan()
+        with self.assertRaisesRegex(ValueError, "did not produce executable artifact"):
+            self.run_mock_build(plan, no_cargo_binary=True)
+        record = Path(plan["provenance_directory"]) / "provenance.json"
+        self.assertEqual(json.loads(record.read_text())["state"], "failed")
 
     def test_dirty_after_plan_refused_before_build(self):
         plan = self.plan()

@@ -41,10 +41,10 @@ pub const DEFAULT_API_BASE: &str = "https://api.jcode.sh/v1";
 pub const DEFAULT_BUILD_BASE: &str = "https://build.jcode.sh/v1";
 
 fn host_status_path() -> Result<&'static str> {
-    Ok(if crate::remote_windows::selected()? {
-        "build/host?platform=windows&target=x86_64-pc-windows-msvc"
-    } else {
-        "build/host"
+    Ok(match crate::remote_windows::selected_platform()? {
+        "windows" => "build/host?platform=windows&target=x86_64-pc-windows-msvc",
+        "macos" => "build/host?platform=macos&target=aarch64-apple-darwin",
+        _ => "build/host",
     })
 }
 const ENV_FILE: &str = "jcode-subscription.env";
@@ -54,6 +54,12 @@ const POLL: Duration = Duration::from_secs(2);
 fn connect_timeout(windows: bool) -> Duration {
     Duration::from_secs(if windows { 12 * 60 } else { 6 * 60 })
 }
+/// A host caught in its idle stop cannot be started until the stop finishes,
+/// which takes minutes on a large machine. That wait is not part of the start,
+/// so it gets its own bound instead of using up [`connect_timeout`]. Giving up
+/// during the stop also leaves the host stopped, because only a connect poll
+/// starts it again.
+const STOP_WAIT: Duration = Duration::from_secs(10 * 60);
 /// A ready this recent counts as up for routing even before the master check.
 const RECENT_READY_S: u64 = 60;
 
@@ -259,10 +265,17 @@ impl Creds {
     /// The 443 relay to this account's own build machine (`remote_tunnel`).
     /// The server chooses the destination from the key, never the client.
     pub(crate) fn tunnel_request(&self, windows: bool) -> (String, tungstenite::http::HeaderValue) {
-        let url = self.url(if windows {
-            "build/tunnel?platform=windows"
-        } else {
-            "build/tunnel"
+        self.tunnel_request_platform(if windows { "windows" } else { "linux" })
+    }
+
+    pub(crate) fn tunnel_request_platform(
+        &self,
+        platform: &str,
+    ) -> (String, tungstenite::http::HeaderValue) {
+        let url = self.url(match platform {
+            "windows" => "build/tunnel?platform=windows",
+            "macos" => "build/tunnel?platform=macos",
+            _ => "build/tunnel",
         });
         let url = if let Some(rest) = url.strip_prefix("https://") {
             format!("wss://{rest}")
@@ -1340,7 +1353,59 @@ fn event_agent() -> ureq::Agent {
         .new_agent()
 }
 
+#[cfg(test)]
 fn send_event_native(agent: &ureq::Agent, c: &Creds, path: &str, body: &Value) -> Result<u16> {
+    send_event_reply(agent, c, path, body).map(|(code, _)| code)
+}
+
+/// How long the detached sender waits before each resend of a terminal event
+/// that matched no row.
+const UNAPPLIED_RETRY_MS: [u64; 4] = [500, 1000, 2000, 4000];
+
+/// True when the service accepted a terminal event (`done`, `abandoned`) but
+/// changed no row. A warm admission is a local lease checkout: the row is
+/// inserted later, when the sync daemon redeems the lease. A run that ends
+/// first (a prebuild stopped 95 ms after it started) reports before its row
+/// exists, and the row then stays "queued" until the sweeper calls it lost.
+fn terminal_event_unapplied(body: &Value, code: u16, reply: &[u8]) -> bool {
+    matches!(body["event"].as_str(), Some("done" | "abandoned"))
+        && (200..300).contains(&code)
+        && serde_json::from_slice::<Value>(reply)
+            .ok()
+            .is_some_and(|r| r["changed"].as_u64() == Some(0))
+}
+
+/// Send one event, and resend a terminal one while the service says it
+/// matched no row. The event is an idempotent forward-only update, so a
+/// resend can only apply it once. A transport failure is never retried: its
+/// outcome is ambiguous.
+fn send_event_until_applied(
+    agent: &ureq::Agent,
+    c: &Creds,
+    path: &str,
+    body: &Value,
+    mut pause: impl FnMut(Duration),
+) -> Result<u16> {
+    let mut waits = UNAPPLIED_RETRY_MS.iter();
+    loop {
+        let (code, reply) = send_event_reply(agent, c, path, body)?;
+        if !terminal_event_unapplied(body, code, &reply) {
+            return Ok(code);
+        }
+        let Some(ms) = waits.next() else {
+            return Ok(code);
+        };
+        pause(Duration::from_millis(*ms));
+    }
+}
+
+/// The status and the start of the reply (enough for `{"ok":true,"changed":N}`).
+fn send_event_reply(
+    agent: &ureq::Agent,
+    c: &Creds,
+    path: &str,
+    body: &Value,
+) -> Result<(u16, Vec<u8>)> {
     use std::io::Read;
     let encoded = body.to_string();
     anyhow::ensure!(encoded.len() as u64 <= MAX_EVENT_BYTES, "event too large");
@@ -1351,12 +1416,12 @@ fn send_event_native(agent: &ureq::Agent, c: &Creds, path: &str, body: &Value) -
         .header("Authorization", c.authorization_header())
         .send(encoded)?;
     let code = response.status().as_u16();
-    let bytes = std::io::copy(
-        &mut response.body_mut().as_reader().take(MAX_EVENT_BYTES + 1),
-        &mut std::io::sink(),
-    )?;
+    let mut reader = response.body_mut().as_reader().take(MAX_EVENT_BYTES + 1);
+    let mut head = Vec::new();
+    let kept = (&mut reader).take(4096).read_to_end(&mut head)? as u64;
+    let bytes = kept + std::io::copy(&mut reader, &mut std::io::sink())?;
     anyhow::ensure!(bytes <= MAX_EVENT_BYTES, "event response too large");
-    Ok(code)
+    Ok((code, head))
 }
 
 /// Independent child, like the previous detached curl: it survives the build
@@ -1368,7 +1433,13 @@ pub(crate) fn event_sender_main() -> ! {
         let event = parse_event_envelope(std::io::stdin().lock())?;
         let mut creds = Creds::new(DEFAULT_API_BASE.into(), event.key)?;
         creds.set_build_base(DEFAULT_BUILD_BASE.into())?;
-        send_event_native(&event_agent(), &creds, &event.path, &event.body)?;
+        send_event_until_applied(
+            &event_agent(),
+            &creds,
+            &event.path,
+            &event.body,
+            std::thread::sleep,
+        )?;
         Ok(())
     })();
     std::process::exit(if result.is_ok() { 0 } else { 1 });
@@ -1828,7 +1899,12 @@ fn parse_ready(b: &Value) -> Result<Ready> {
 }
 
 fn parse_ready_for(b: &Value, windows: bool) -> Result<Ready> {
-    let expected = if windows { "windows" } else { "linux" };
+    parse_ready_for_platform(b, if windows { "windows" } else { "linux" })
+}
+
+fn parse_ready_for_platform(b: &Value, expected: &str) -> Result<Ready> {
+    let windows = expected == "windows";
+    let macos = expected == "macos";
     if b.get("platform")
         .is_some_and(|p| p.as_str() != Some(expected))
         || (windows
@@ -1839,7 +1915,15 @@ fn parse_ready_for(b: &Value, windows: bool) -> Result<Ready> {
                 || b["ssh_certificate"]
                     .as_str()
                     .is_none_or(|c| c.is_empty() || c.contains(['\r', '\n']))))
+        || (macos
+            && (b["platform"] != "macos"
+                || b["transport"] != crate::remote_windows::MACOS_TRANSPORT
+                || b["target"] != crate::remote_windows::MACOS_TARGET
+                || b["ssh_certificate"]
+                    .as_str()
+                    .is_none_or(|c| c.is_empty() || c.contains(['\r', '\n']))))
         || (!windows
+            && !macos
             && b.get("transport")
                 .is_some_and(|t| !matches!(t.as_str(), Some("ssh" | "linux"))))
     {
@@ -1935,16 +2019,28 @@ fn connect_with_mode(
     mut progress: impl FnMut(&str),
 ) -> Result<Ready> {
     let start = Instant::now();
-    let windows = crate::remote_windows::selected()?;
+    let platform = crate::remote_windows::selected_platform()?;
+    let windows = platform == "windows";
+    let macos = platform == "macos";
     let mut body = if windows {
         json!({ "public_key": public_key.trim(), "platform": "windows", "target": crate::remote_windows::TARGET })
+    } else if macos {
+        json!({ "public_key": public_key.trim(), "platform": "macos", "target": crate::remote_windows::MACOS_TARGET })
     } else {
         json!({ "public_key": public_key.trim(), "platform": "linux", "native_transport": native_mode != Some(false), "native_only": native_only_requested(native_mode) })
     };
     let mut last = String::new();
     let mut retried_unavailable = false;
+    // Time spent waiting for a stop to finish, which the start budget excludes.
+    let mut stopping = Duration::ZERO;
+    let mut polled = start;
     loop {
         let r = request(c, "POST", "build/host/connect", Some(&body))?;
+        let since = polled.elapsed();
+        polled = Instant::now();
+        if (200..=299).contains(&r.code) && r.body["state"] == "stopping" {
+            stopping = (stopping + since).min(STOP_WAIT);
+        }
         if !windows
             && native_mode != Some(true)
             && !native_only_requested(native_mode)
@@ -1961,7 +2057,7 @@ fn connect_with_mode(
         }
         match r.code {
             200 if r.body["ready"].as_bool() != Some(false) => {
-                let ready = parse_ready_for(&r.body, windows)?;
+                let ready = parse_ready_for_platform(&r.body, platform)?;
                 if windows {
                     crate::remote_windows::verify_certificate(
                         ready
@@ -2006,7 +2102,8 @@ fn connect_with_mode(
             }
             _ => return Err(api_error(&r)),
         }
-        if start.elapsed() >= timeout {
+        let spent = start.elapsed().saturating_sub(stopping);
+        if spent >= timeout {
             bail!(
                 "{}",
                 platform_guidance(
@@ -2018,11 +2115,7 @@ fn connect_with_mode(
                 )
             );
         }
-        std::thread::sleep(poll_wait(
-            &r.body,
-            poll,
-            timeout.saturating_sub(start.elapsed()),
-        ));
+        std::thread::sleep(poll_wait(&r.body, poll, timeout.saturating_sub(spent)));
     }
 }
 
@@ -2076,10 +2169,10 @@ pub fn dev_mode() -> bool {
 }
 
 pub fn dir() -> Result<PathBuf> {
-    let d = if crate::remote_windows::selected()? {
-        crate::remote::dir()?.join("hosted/windows/x86_64-pc-windows-msvc")
-    } else {
-        crate::remote::dir()?.join("hosted")
+    let d = match crate::remote_windows::selected_platform()? {
+        "windows" => crate::remote::dir()?.join("hosted/windows/x86_64-pc-windows-msvc"),
+        "macos" => crate::remote::dir()?.join("hosted/macos/aarch64-apple-darwin"),
+        _ => crate::remote::dir()?.join("hosted"),
     };
     std::fs::create_dir_all(&d)?;
     set_mode(&d, 0o700);
@@ -2210,7 +2303,9 @@ fn proxy_for(tunnel: bool) -> Option<String> {
     if !tunnel {
         return None;
     }
-    crate::remote_tunnel::proxy_command(crate::remote_windows::selected().unwrap_or(false))
+    crate::remote_tunnel::proxy_command_platform(
+        crate::remote_windows::selected_platform().unwrap_or("linux"),
+    )
 }
 
 fn now() -> u64 {
@@ -2585,10 +2680,11 @@ fn ensure_ready_mode(refresh: bool, native_mode: Option<bool>) -> Result<Target>
                     "native hosted transport was required, but this worker does not advertise it"
                 );
             }
-            let mut tunnel = native.is_none()
-                && use_tunnel(setting("JUSTRUST_HOSTED_TUNNEL").as_deref(), || {
-                    direct_reachable(&r.address, r.port)
-                });
+            let mut tunnel = crate::remote_windows::selected_platform().unwrap_or("linux") == "macos"
+                || (native.is_none()
+                    && use_tunnel(setting("JUSTRUST_HOSTED_TUNNEL").as_deref(), || {
+                        direct_reachable(&r.address, r.port)
+                    }));
             let proxy = proxy_for(tunnel);
             tunnel = proxy.is_some();
             let mut t = if tunnel {
@@ -3162,6 +3258,46 @@ mod tests {
         let e = connect_with(&c, "k", Duration::from_millis(5), Duration::ZERO, |_| {})
             .unwrap_err()
             .to_string();
+        assert!(e.contains("did not become ready"), "{e}");
+    }
+
+    /// Run 45776680900: a release test connected two minutes after the host's
+    /// idle stop was issued, was told "Starting your workspace host..." for the
+    /// whole six minute start budget while the stop was still in progress, and
+    /// gave up. Nothing polled after that, so the host stayed down four hours.
+    #[test]
+    fn waiting_out_a_host_stop_does_not_use_the_start_budget() {
+        let stopping = r#"{"state":"stopping","ready":false,"message":"finishing an idle stop","retry_after_ms":100}"#;
+        let booting = r#"{"state":"booting","ready":false,"message":"booting","retry_after_ms":1}"#;
+        let mut replies = vec![(202, stopping); 4];
+        replies.push((202, booting));
+        replies.push((200, READY));
+        let (c, seen) = mock(replies);
+        let mut msgs = Vec::new();
+        // The stop outlasts the budget: 300 ms of stopping polls against
+        // 250 ms, of which only the last 100 ms wait counts as starting.
+        connect_with(
+            &c,
+            "k",
+            Duration::from_millis(1),
+            Duration::from_millis(250),
+            |m| msgs.push(m.to_string()),
+        )
+        .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 6);
+        assert_eq!(msgs, ["finishing an idle stop", "booting"]);
+
+        // A start that is slow on its own still times out.
+        let (c, _) = mock(vec![(202, booting); 400]);
+        let e = connect_with(
+            &c,
+            "k",
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("did not become ready"), "{e}");
     }
 
